@@ -1,0 +1,20 @@
+[package]
+name = "gamespy-runtime"
+version = "0.1.0"
+description = "Embeddable GameSpy service runtime"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+soap = ["gamespy-proto/soap"]
+
+[dependencies]
+gamespy-proto = { workspace = true }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+
+[lints]
+workspace = true
