@@ -15,7 +15,7 @@ fn numeric_field_operands_preserve_comparisons_and_precedence() {
         ("<=", true),
         (">=", false),
     ] {
-        let filter = Filter::parse_numeric(&format!("players{op}capacity")).unwrap();
+        let filter = Filter::parse(&format!("players{op}capacity")).unwrap();
         assert_eq!(filter.matches(&keys), expected, "{op}");
         assert!(filter.references_field("players"));
         assert!(filter.references_field("capacity"));

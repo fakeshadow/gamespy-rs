@@ -132,13 +132,11 @@ impl Filter {
     }
 
     /// Empty means no constraints. Omitted fields are never defaulted to zero.
+    ///
+    /// Every clause is a numeric predicate: without the original title's
+    /// boolean dictionary nothing is classified as a [`Preference`], so pass
+    /// that dictionary to [`Filter::parse_with_preferences`] when there is one.
     pub fn parse(text: &str) -> Result<Self, &'static str> {
-        Self::parse_with_preferences(text, |_| false)
-    }
-
-    /// Numeric field matching without the original title's boolean dictionary.
-    /// No missing field is assigned a default value.
-    pub fn parse_numeric(text: &str) -> Result<Self, &'static str> {
         Self::parse_with_preferences(text, |_| false)
     }
 

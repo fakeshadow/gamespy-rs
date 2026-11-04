@@ -295,3 +295,51 @@ fn runtime_shutdown_timeout_does_not_wait_for_blocking_pool_work() {
     assert!(start.elapsed() < Duration::from_secs(1));
     release_tx.send(()).unwrap();
 }
+
+/// A failed accept used to end the listener for the rest of the process. The
+/// decision is a pure function of the error kind, so the policy can be checked
+/// without inducing a kernel error.
+///
+/// Nothing here may pace a reset-driven failure. A peer can produce those at
+/// will by resetting between SYN and accept, so pacing them would hand it the
+/// accept rate for every other peer, and no counter of consecutive failures is
+/// safe either: under a flood the successful accept that would reset such a
+/// counter is itself queued behind the pacing.
+#[test]
+fn a_failed_accept_neither_ends_nor_throttles_the_listener() {
+    for kind in [
+        io::ErrorKind::ConnectionAborted,
+        io::ErrorKind::ConnectionReset,
+        io::ErrorKind::Interrupted,
+    ] {
+        assert_eq!(
+            accept_retry(&io::Error::from(kind)),
+            AcceptRetry::Now,
+            "{kind:?} consumed its queued connection, so draining must not pause"
+        );
+    }
+
+    // A thousand of them in a row is an attacker's flood, not a broken socket,
+    // and every one of them still drains the backlog at full speed.
+    for _ in 0..1000 {
+        assert_eq!(
+            accept_retry(&io::Error::from(io::ErrorKind::ConnectionAborted)),
+            AcceptRetry::Now,
+            "a reset flood must never slow the accept loop"
+        );
+    }
+
+    // A failure that consumed nothing repeats immediately, so it is paced to
+    // leave the CPU to handlers whose exit frees a descriptor.
+    for kind in [
+        io::ErrorKind::PermissionDenied,
+        io::ErrorKind::OutOfMemory,
+        io::ErrorKind::Unsupported,
+    ] {
+        assert_eq!(
+            accept_retry(&io::Error::from(kind)),
+            AcceptRetry::AfterPause,
+            "{kind:?} made no progress, so an immediate retry would spin"
+        );
+    }
+}

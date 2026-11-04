@@ -11,6 +11,7 @@ use std::sync::{
 struct Registry {
     sweeps: AtomicUsize,
     keepalives: AtomicUsize,
+    entries: Vec<(SessionId, SessionData)>,
 }
 impl Observer for Registry {}
 impl Backend for Registry {
@@ -30,7 +31,7 @@ impl Backend for Registry {
         Availability::Gone
     }
     fn listable(&self, _: Instant) -> Vec<(SessionId, SessionData)> {
-        Vec::new()
+        self.entries.clone()
     }
     fn select(
         &self,
@@ -45,6 +46,62 @@ impl Backend for Registry {
     fn query_port(&self) -> u16 {
         0
     }
+}
+
+#[test]
+fn routing_uses_names_then_exact_socket_bindings_and_rejects_conflicts() {
+    let peer: std::net::SocketAddr = "192.0.2.1:7000".parse().unwrap();
+    let other: std::net::SocketAddr = "192.0.2.1:7001".parse().unwrap();
+    let key = [1, 2, 3, 4];
+    let held = |source| -> SharedRegistry {
+        Arc::new(Registry {
+            entries: vec![(
+                SessionId::new(source, key),
+                SessionData {
+                    preferences: (),
+                    source,
+                    advertised_port: 7000,
+                    local_port: None,
+                    natneg: true,
+                    keys: vec![],
+                },
+            )],
+            ..Default::default()
+        })
+    };
+    let routes = vec![("alpha".into(), held(peer)), ("beta".into(), held(other))];
+    let now = Instant::now();
+    let keepalive = [8, 1, 2, 3, 4];
+    assert_eq!(route_qr2(&routes, peer, &keepalive, now), Some(0));
+    assert_eq!(route_qr2(&routes, other, &keepalive, now), Some(1));
+    assert_eq!(
+        route_qr2(&routes, "192.0.2.1:7002".parse().unwrap(), &keepalive, now),
+        None
+    );
+    let heartbeat = |keys: &[u8]| {
+        let mut bytes = vec![3, 1, 2, 3, 4];
+        bytes.extend_from_slice(keys);
+        bytes
+    };
+    assert_eq!(
+        route_qr2(&routes, peer, &heartbeat(b"gamename\0ALPHA\0\0"), now),
+        Some(0)
+    );
+    for keys in [
+        b"gamename\0beta\0\0".as_slice(),
+        b"gamename\0unknown\0\0",
+        b"gamename\0alpha\0gamename\0beta\0\0",
+        b"hostname\0anonymous\0\0",
+    ] {
+        assert_eq!(route_qr2(&routes, peer, &heartbeat(keys), now), None);
+    }
+    assert_eq!(
+        route_qr2(&routes, peer, &heartbeat(b"statechanged\x002\0\0"), now),
+        Some(0)
+    );
+    // An ambiguous binding must not refresh or remove either title.
+    let conflicting = vec![("alpha".into(), held(peer)), ("beta".into(), held(peer))];
+    assert_eq!(route_qr2(&conflicting, peer, &keepalive, now), None);
 }
 
 #[test]

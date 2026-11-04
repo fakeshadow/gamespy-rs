@@ -3,15 +3,76 @@
 //! See [`spawn_with_listener`] for the SDK endpoint and port. [`Config`],
 //! [`read_request`] and the reply builders share that service; none configures
 //! DNS. Reply builders operate on supplied requests and registry snapshots.
+//!
+//! Relaying a joining client's message to a host needs the QR2 socket, not a
+//! socket of this listener's own; see [`Relay`] for why, and pass one to
+//! [`spawn_with_listener`].
 
 use crate::listener::Listener;
-use std::net::{IpAddr, SocketAddr, TcpListener};
+use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gamespy_proto::browser::{self, ListRequest};
 use gamespy_proto::browser_crypt::{self, KEY_LEN};
 use gamespy_proto::browser_response::{self, ListedServer};
+
+/// The socket a relay leaves from.
+///
+/// A joining client asks the master to tell a host to start negotiating, and
+/// the master is only a courier for that message. The host's NAT mapping was
+/// created by its own heartbeats to the QR2 socket, so a relay arriving from
+/// any other source port is accepted only by a NAT that does not restrict by
+/// port — and a NAT that does is the case this path exists to serve. Build
+/// this from the QR2 socket and relays leave from the address hosts are
+/// already sending to.
+///
+/// Opens nothing itself: [`Relay::from_qr2_socket`] clones a socket the
+/// application already owns, which is also how QR2 sends its own replies.
+#[derive(Clone, Debug)]
+pub struct Relay {
+    socket: Arc<UdpSocket>,
+    /// Rendered once, because a relay's source address is the thing that
+    /// decides whether a host behind a restrictive NAT ever sees it.
+    origin: Arc<str>,
+}
+
+impl Relay {
+    /// Clone the socket destined for [`crate::availability::spawn_with_socket`].
+    /// Clone it first: that call takes ownership of the socket.
+    pub fn from_qr2_socket(socket: &UdpSocket) -> std::io::Result<Self> {
+        Self::new(socket.try_clone()?, "the QR2 socket")
+    }
+
+    /// A socket of the browser's own, for a deployment that runs no QR2
+    /// listener. Relays sent from it do not reach a host whose NAT restricts
+    /// by port, which is why the listener says so once at startup.
+    fn unrelated() -> std::io::Result<Self> {
+        Self::new(UdpSocket::bind("0.0.0.0:0")?, "not the QR2 socket")
+    }
+
+    fn new(socket: UdpSocket, what: &str) -> std::io::Result<Self> {
+        let origin = match socket.local_addr() {
+            Ok(address) => format!("{address} ({what})"),
+            Err(error) => format!("an unreadable address ({what}; {error})"),
+        };
+        Ok(Self {
+            socket: Arc::new(socket),
+            origin: origin.into(),
+        })
+    }
+
+    /// Where relays leave from, as a host sees it.
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// Hand one packet to the kernel. Success is not delivery: UDP reports
+    /// nothing, and a host's NAT may drop what this accepted.
+    fn send_to(&self, packet: &[u8], host: SocketAddr) -> std::io::Result<usize> {
+        self.socket.send_to(packet, host)
+    }
+}
 
 /// Browser protocol configuration; DNS and binding remain application-owned.
 pub struct Config {
@@ -30,6 +91,11 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to hold the connection open after replying, waiting for the
 /// client to close it.
 const LINGER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How much of a composed list payload goes into one trace line. A full
+/// reply for a handful of sessions fits; a large registry is truncated rather
+/// than flooding a capture.
+const MAX_TRACED_PAYLOAD: usize = 2048;
 /// Bytes of header block 2. The client folds each one into the key, so more
 /// is better up to the point of pointlessness.
 const BLOCK2_LEN: usize = 16;
@@ -40,30 +106,57 @@ const BLOCK2_LEN: usize = 16;
 /// comes from [`gamespy_proto::title::master_server_index`] for the query game.
 /// This is distinct from the QR2 registration name `{game}.master.gamespy.com`.
 /// See the [crate DNS guide](crate) for client overrides and binding policy.
+/// `relay` carries the QR2 socket, so a relayed client message reaches a host
+/// from the address its heartbeats go to; see [`Relay`]. `None` gives the
+/// listener a socket of its own, which a host behind a NAT that restricts by
+/// port will not accept relays from.
 pub fn spawn_with_listener(
     config: Config,
     registry: SharedRegistry,
     listener: TcpListener,
+    relay: Option<Relay>,
 ) -> Result<Listener, String> {
-    registry.event(
+    spawn_multi_with_listener(vec![(config, registry)], listener, relay)
+}
+
+/// Serve several titles on one browser endpoint. The query game selects the
+/// secret and registry; follow-up frames retain that selection.
+pub fn spawn_multi_with_listener(
+    routes: Vec<(Config, SharedRegistry)>,
+    listener: TcpListener,
+    relay: Option<Relay>,
+) -> Result<Listener, String> {
+    if routes.is_empty() {
+        return Err("browser needs at least one title".into());
+    }
+    // One socket for the listener's life either way, rather than one bound and
+    // closed per relayed message, which a client could otherwise drive.
+    let relay = match relay {
+        Some(relay) => relay,
+        None => Relay::unrelated().map_err(|error| error.to_string())?,
+    };
+    routes[0].1.event(
         "browser",
         &format!(
-            "listening on {} (TCP, master list; lists registered sessions)",
-            listener.local_addr().map_err(|error| error.to_string())?
+            "listening on {} (TCP; {} title routes); relays leave from {}",
+            listener.local_addr().map_err(|e| e.to_string())?,
+            routes.len(),
+            relay.origin(),
         ),
     );
-    let shared = Arc::new((config, registry));
+    let shared = Arc::new(routes);
     crate::tcp::spawn_with_listener(listener, "browser", async move |stream| {
-        serve_connection(&shared.0, &shared.1, stream).await
+        serve_connection(&shared, &relay, stream).await
     })
     .map_err(|error| error.to_string())
 }
 
 async fn serve_connection(
-    config: &Config,
-    registry: &SharedRegistry,
+    routes: &[(Config, SharedRegistry)],
+    relay: &Relay,
     mut stream: crate::tcp::Connection,
 ) {
+    let registry = &routes[0].1;
     let peer = stream
         .peer_addr()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
@@ -89,6 +182,16 @@ async fn serve_connection(
             return;
         }
     };
+
+    let mut candidates = routes
+        .iter()
+        .filter(|(config, _)| request.for_game.eq_ignore_ascii_case(&config.game_name));
+    let Some((config, registry)) = candidates.next() else {
+        return;
+    };
+    if candidates.next().is_some() {
+        return;
+    }
 
     registry.peer_event(
         "browser",
@@ -168,7 +271,7 @@ async fn serve_connection(
     // matters in its own right too: the SDK ends a list on the
     // terminator and hangs up itself, and a FIN from this side first
     // can be read as an unexpected disconnect.
-    serve_follow_ups(&mut stream, peer, &mut cipher, registry, &declared).await;
+    serve_follow_ups(&mut stream, peer, &mut cipher, registry, &declared, relay).await;
 }
 
 /// Serve follow-up requests on a connection that has already been given a
@@ -186,8 +289,14 @@ async fn serve_follow_ups(
     cipher: &mut browser_crypt::Cipher,
     registry: &SharedRegistry,
     declared: &[String],
+    relay: &Relay,
 ) {
     let _ = stream.set_read_timeout(Some(LINGER_TIMEOUT));
+    let context = FollowUpContext {
+        registry,
+        declared,
+        relay,
+    };
     let mut pending: Vec<u8> = Vec::new();
     let mut scratch = [0u8; 512];
 
@@ -230,7 +339,6 @@ async fn serve_follow_ups(
                                     address[0], address[1], address[2], address[3]
                                 ),
                             );
-                            let context = FollowUpContext { registry, declared };
                             if !answer_server_info(stream, peer, cipher, &context, address, port)
                                 .await
                             {
@@ -258,8 +366,7 @@ async fn serve_follow_ups(
                             // captured from a console, so its bytes are the
                             // evidence for whether the type number is right.
                             registry.bytes("browser", peer, "relay payload", &message, 256);
-                            relay_to_host(peer, &context_of(registry, declared), address, &message)
-                                .await;
+                            relay_to_host(peer, &context, address, port, &message).await;
                         }
                         browser::FollowUp::Other {
                             request_type,
@@ -315,11 +422,8 @@ struct FollowUpContext<'a> {
     /// carry one value per declared key, because the client parses it against
     /// the same key array.
     declared: &'a [String],
-}
-
-/// Bundle what the follow-up handlers need.
-fn context_of<'a>(registry: &'a SharedRegistry, declared: &'a [String]) -> FollowUpContext<'a> {
-    FollowUpContext { registry, declared }
+    /// Where a relayed client message leaves from; see [`Relay`].
+    relay: &'a Relay,
 }
 
 /// Pass a joining client's message to the host it names.
@@ -333,19 +437,30 @@ async fn relay_to_host(
     peer: SocketAddr,
     context: &FollowUpContext<'_>,
     address: [u8; 4],
+    port: u16,
     message: &[u8],
 ) {
     let registry = context.registry;
-    let target = {
-        context
-            .registry
-            .listable(Instant::now())
-            .into_iter()
-            .find(|(id, _)| peer_octets(id.peer_ip) == Some(address))
-            .map(|(id, data)| (id.instance_key, data.source))
+    let now = Instant::now();
+    // The request names a port as well as an address, and it is used: two
+    // consoles behind one NAT share a public address, so matching on the
+    // address alone can only ever pick one of them, and nothing would tell us
+    // it was the right one. `locate` applies the same port rule a server-info
+    // follow-up uses, so a client naming either the host's advertised port or
+    // the query port resolves to exactly one session.
+    //
+    // Address-only remains the fallback rather than the rule. No console
+    // capture of this request exists yet, so a peer may well name a port this
+    // service cannot match; refusing it outright would be a regression on
+    // behaviour that works today. Which of the two matched is recorded.
+    let (matched_on, target) = match registry.locate(address, Some(port), now) {
+        Some(found) => ("address_and_port", Some(found)),
+        None => ("address_only_fallback", registry.locate(address, None, now)),
     };
+    let target =
+        target.map(|(id, data)| (id.instance_key, data.source, data.natneg, data.local_port));
 
-    let Some((instance_key, source)) = target else {
+    let Some((instance_key, source, natneg, local_port)) = target else {
         registry.peer_event(
             "browser",
             peer,
@@ -355,17 +470,42 @@ async fn relay_to_host(
     };
 
     let packet = gamespy_proto::qr2::client_message(instance_key, message);
-    let sent = async {
-        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-        socket.send_to(&packet, source).await
-    }
-    .await;
-    match sent {
-        Ok(_) => registry.peer_event(
-            "browser",
-            peer,
-            &format!("relayed {} bytes to the host at {source}", message.len()),
-        ),
+    // Sent on the relay socket rather than a fresh one, so the host sees it
+    // coming from the address it heartbeats to. Logged as sent, not delivered:
+    // UDP says nothing, and a NAT may still drop what the kernel accepted.
+    match context.relay.send_to(&packet, source) {
+        Ok(_) => {
+            registry.peer_event(
+                "browser",
+                peer,
+                &format!(
+                    "relay sent: {} bytes to the host at {source}, from {}",
+                    message.len(),
+                    context.relay.origin()
+                ),
+            );
+            // The whole negotiation starts here: this message is what tells a
+            // host to begin. It is sent once, carries no message id, and no
+            // acknowledgement is matched to it, so a single lost datagram
+            // leaves the joining peer sending INITs to a host that never
+            // negotiates. Recorded with the host's own negotiation fields,
+            // which nothing else in this service reads.
+            registry.peer_event(
+                "browser",
+                peer,
+                &format!(
+                    "relay trace: instance={} target={source} requested_port={port} \
+                     matched_on={matched_on} natneg_key={natneg} localport={} payload={}; \
+                     sent once, unacknowledged and not retried",
+                    crate::observe::hex(&instance_key),
+                    match local_port {
+                        Some(port) => port.to_string(),
+                        None => "absent".into(),
+                    },
+                    crate::observe::hex(message),
+                ),
+            );
+        }
         Err(error) => registry.peer_event(
             "browser",
             peer,
@@ -383,24 +523,15 @@ async fn answer_server_info(
     address: [u8; 4],
     port: u16,
 ) -> bool {
-    let FollowUpContext { registry, declared } = context;
-    // Find the session the client is asking about. It identifies a server by
-    // the address it was given, and the port it believes that server is on,
-    // which is either the one carried in the entry or the header's query
-    // port.
-    let session = {
-        registry
-            .listable(Instant::now())
-            .into_iter()
-            .find(|(id, data)| {
-                // The client names either the port the entry carried or, if
-                // the entry had none, the query port from the reply header
-                // (0x00aec870). Both identify this session.
-                peer_octets(id.peer_ip) == Some(address)
-                    && (port == data.advertised_port || port == registry.query_port())
-            })
-            .map(|(_, data)| data.keys.clone())
-    };
+    let FollowUpContext {
+        registry, declared, ..
+    } = context;
+    // Find the session the client is asking about. The client names either the port the entry carried or, if the entry had
+    // none, the query port from the reply header (0x00aec870); both identify
+    // this session, and `locate` is where that rule lives.
+    let session = registry
+        .locate(address, Some(port), Instant::now())
+        .map(|(_, data)| data.keys);
 
     let Some(keys) = session else {
         // Saying nothing is what left a console searching, so this is
@@ -486,17 +617,6 @@ pub async fn read_request(stream: &mut crate::tcp::Connection) -> Option<Vec<u8>
     buffered[..2].copy_from_slice(&prefix);
     stream.read_exact(&mut buffered[2..]).await.ok()?;
     Some(buffered)
-}
-
-/// Build the session-list reply for one request.
-/// No transport is opened; see [`spawn_with_listener`] for the browser endpoint.
-pub fn build_reply_for(
-    request: &ListRequest<'_>,
-    secret: &str,
-    peer: IpAddr,
-    registry: &SharedRegistry,
-) -> Option<Vec<u8>> {
-    build_list_reply(request, secret, peer, registry).map(|(bytes, _, _, _)| bytes)
 }
 
 /// One registered session, flattened out of the registry lock: the address
@@ -595,8 +715,79 @@ pub fn build_list_reply(
         })
         .collect();
 
+    // Per-entry trace: the flags byte and address the client will actually
+    // parse, plus the negotiation fields the host advertised that no flag
+    // currently carries. A client that drops an entry leaves no trace of its
+    // own, so the entry as composed is the only record of what it was given.
+    // Zipped positionally, not matched by address: two sessions behind one
+    // NAT share an address, and looking an entry up by it would report the
+    // first one's port for both. `sessions`, `values` and `servers` are built
+    // in one order and stay in it.
+    for ((address, keys), server) in sessions.iter().zip(servers.iter()) {
+        let port = server.port;
+        let mut flags = browser_response::ENTRY_HAS_KEYS;
+        if port.is_some() {
+            flags |= browser_response::ENTRY_HAS_PORT;
+        }
+        let key = |wanted: &str| {
+            keys.iter()
+                .find(|(key, _)| key == wanted)
+                .map(|(_, value)| value.as_str())
+        };
+        registry.event(
+            "browser",
+            &format!(
+                "entry trace: address={}.{}.{}.{} port={} flags={flags:#04x} \
+                 (has_keys={}, has_port={}, has_full_rules=false, connect_negotiate=false, \
+                 private_ip=false) values={} advertised_natneg={} advertised_localip0={} \
+                 advertised_localport={}",
+                address[0],
+                address[1],
+                address[2],
+                address[3],
+                match port {
+                    Some(port) => port.to_string(),
+                    None => format!("absent, client falls back to {}", registry.query_port()),
+                },
+                flags & browser_response::ENTRY_HAS_KEYS != 0,
+                flags & browser_response::ENTRY_HAS_PORT != 0,
+                server.values.len(),
+                key("natneg").unwrap_or("absent"),
+                key("localip0").unwrap_or("absent"),
+                key("localport").unwrap_or("absent"),
+            ),
+        );
+    }
+
     let payload =
         browser_response::list_payload(peer_ip, registry.query_port(), &declared, &servers)?;
+    // The composed payload before encryption. This is the one thing a client
+    // that silently ignores a reply cannot be diagnosed without: it is what
+    // a known-good capture gets compared against, byte for byte.
+    registry.event(
+        "browser",
+        &format!(
+            "payload trace: {} bytes for {} server(s), {} declared key(s), terminator={}",
+            payload.len(),
+            servers.len(),
+            declared.len(),
+            crate::observe::hex(&browser_response::LIST_TERMINATOR),
+        ),
+    );
+    // Through the `bytes` hook, not `event`: this is a raw payload, and that
+    // is the hook an application can redact independently.
+    //
+    // The port is a placeholder. This function is given the peer's `IpAddr`,
+    // not its `SocketAddr`, so a capture shows `<ip>:0` here. Carrying the
+    // full address would widen a public signature, which is not worth doing
+    // for a log line; the connection's own traces carry the real port.
+    registry.bytes(
+        "browser",
+        SocketAddr::new(peer, 0),
+        "composed list payload (plaintext; peer port not available at this layer)",
+        &payload,
+        MAX_TRACED_PAYLOAD,
+    );
     let (sealed, cipher) = seal_streaming(request, secret, &payload, registry)?;
     let declared = declared.into_iter().map(str::to_string).collect();
     Some((sealed, cipher, declared, sessions.len()))
@@ -618,48 +809,13 @@ fn seal_streaming(
     browser_response::encode_streaming(challenge, secret.as_bytes(), block1, &block2, payload)
 }
 
-/// Build the encrypted empty-list reply for one request.
-/// No transport is opened; `query_port` is advertised protocol data, not a
-/// listener binding. See [`spawn_with_listener`] for the browser endpoint.
-///
-/// Separated from the socket so it can be tested against the bytes a console
-/// actually sent.
-pub fn build_reply(
-    request: &ListRequest<'_>,
-    secret: &str,
-    query_port: u16,
-    peer: IpAddr,
-    registry: &SharedRegistry,
-) -> Option<Vec<u8>> {
-    let peer_ip = peer_octets(peer)?;
-    let payload = browser_response::empty_list_payload(peer_ip, query_port);
-    seal(request, secret, &payload, registry)
-}
-
 /// The client stores four bytes and the console reaches us over IPv4; refuse
 /// rather than invent an address.
-fn peer_octets(peer: IpAddr) -> Option<[u8; 4]> {
+pub(crate) fn peer_octets(peer: IpAddr) -> Option<[u8; 4]> {
     match peer {
         IpAddr::V4(address) => Some(address.octets()),
         IpAddr::V6(_) => None,
     }
-}
-
-/// Wrap a payload in a freshly randomised header and encrypt it for this
-/// request's challenge.
-fn seal(
-    request: &ListRequest<'_>,
-    secret: &str,
-    payload: &[u8],
-    registry: &SharedRegistry,
-) -> Option<Vec<u8>> {
-    let mut block1 = [0u8; browser_response::BLOCK1_LEN];
-    let mut block2 = [0u8; BLOCK2_LEN];
-    registry.fill_random(&mut block1).ok()?;
-    registry.fill_random(&mut block2).ok()?;
-    let mut challenge = [0u8; KEY_LEN];
-    challenge.copy_from_slice(&request.challenge);
-    browser_response::encode(challenge, secret.as_bytes(), block1, &block2, payload)
 }
 
 // Inspect only fixed framing, even when a new variant cannot parse as a list.
@@ -671,6 +827,9 @@ fn frame_trace(frame: &[u8]) -> String {
         frame.len()
     )
 }
+
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
 mod trace_tests {

@@ -1,4 +1,17 @@
-//! Http.
+//! HTTP/1.1 request parsing and response building for the SOAP services.
+//!
+//! Deliberately stricter than a general HTTP implementation. The only client is
+//! a fixed SDK whose request shapes are known, so anything it never sends is
+//! refused instead of interpreted: a `Transfer-Encoding` of any kind, a
+//! repeated `Content-Length`, a declared length that is not plain digits, a
+//! header name that is not a token, a bare LF inside a CRLF-framed block, and a
+//! request line that is not exactly three valid fields.
+//!
+//! Every one of those is a shape this reader and another HTTP implementation
+//! could resolve differently, and a body boundary two readers disagree about is
+//! how one request becomes two. Refusing costs no function here and removes the
+//! disagreement, which is why these endpoints also expect to be reached
+//! directly; see the runtime's `http` module on intermediaries.
 
 /// Largest request this reader will accept, headers and body together.
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -12,6 +25,9 @@ pub enum HttpError {
     MalformedHeader,
     BadContentLength,
     NotUtf8,
+    /// A `Transfer-Encoding` header was present. Chunked bodies are refused
+    /// rather than decoded; see [`content_length`].
+    UnsupportedTransferEncoding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,56 +63,189 @@ pub fn parse_raw_request(data: &[u8]) -> Result<RawRequest<'_>, HttpError> {
     if data.len() - end != length {
         return Err(HttpError::BadContentLength);
     }
-    let head = parse_request(&data[..end])?;
-    let content_type = headers
-        .lines()
-        .skip(1)
-        .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-type"))
-        .map(|(_, value)| value.trim().to_owned());
+    let head = parse_head(headers)?;
     Ok(RawRequest {
         method: head.method,
         target: head.target,
         host: head.host,
         soap_action: head.soap_action,
         keep_alive: head.keep_alive,
-        content_type,
+        content_type: head.content_type,
         body: &data[end..],
     })
 }
 
 /// Offset one past the end of the header block, if the buffer holds a complete
 /// one. Both CRLF and bare-LF separators are accepted.
+///
+/// Whichever terminator appears **first** ends the block. Searching the whole
+/// buffer for `\r\n\r\n` before looking for `\n\n` moved the boundary past an
+/// earlier bare-LF one whenever a body happened to contain the CRLF form, which
+/// put the header/body split in a different place than any other reader of the
+/// same bytes would choose.
 pub fn header_end(data: &[u8]) -> Option<usize> {
-    if let Some(position) = data.windows(4).position(|window| window == b"\r\n\r\n") {
-        return Some(position + 4);
-    }
-    data.windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|position| position + 2)
-}
-
-/// Content-Length from a complete header block, or `None` when absent.
-pub fn content_length(headers: &str) -> Result<Option<usize>, HttpError> {
-    for line in headers.lines().skip(1) {
-        let Some((name, value)) = line.split_once(':') else {
-            if line.is_empty() {
-                continue;
-            }
-            return Err(HttpError::MalformedHeader);
-        };
-        if name.trim().eq_ignore_ascii_case("content-length") {
-            let length: usize = value
-                .trim()
-                .parse()
-                .map_err(|_| HttpError::BadContentLength)?;
-            if length > MAX_BODY_BYTES {
-                return Err(HttpError::TooLarge);
-            }
-            return Ok(Some(length));
+    let mut index = 0;
+    loop {
+        // Only an LF can end either form, so anchor the scan on it. An `index`
+        // at the end of the buffer slices to empty and reports no terminator.
+        let at = index + data[index..].iter().position(|byte| *byte == b'\n')?;
+        match data.get(at + 1) {
+            Some(b'\n') => return Some(at + 2),
+            Some(b'\r') if data.get(at + 2) == Some(&b'\n') => return Some(at + 3),
+            _ => index = at + 1,
         }
     }
-    Ok(None)
+}
+
+/// An RFC 9110 token, which is the only shape a header name or method may take.
+fn is_token(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+}
+
+/// Header lines of a complete block, as name and trimmed value.
+///
+/// The request line is skipped, and the empty line left by the terminator is
+/// dropped; an interior empty line cannot occur, because it would have been the
+/// terminator [`header_end`] stopped at. A line with no colon, or a name that
+/// is not a token, is an error rather than a line to skip: `Content-Length : 5`
+/// and a space-folded continuation are both shapes another reader of the same
+/// bytes could attribute differently, and the only client never sends either.
+fn header_lines(headers: &str) -> impl Iterator<Item = Result<(&str, &str), HttpError>> {
+    headers
+        .lines()
+        .skip(1)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let (name, value) = line.split_once(':').ok_or(HttpError::MalformedHeader)?;
+            if !is_token(name) {
+                return Err(HttpError::MalformedHeader);
+            }
+            Ok((name, value.trim()))
+        })
+}
+
+/// Length of the body a complete header block declares, or `None` for none.
+///
+/// This is the one function the framing layer calls, so it is where every rule
+/// about *where a request ends* belongs; a reader that frames messages inherits
+/// all of them without having to remember any.
+///
+/// RFC 9112 takes a body's length from `Transfer-Encoding` first and
+/// `Content-Length` only after, so answering "how long is the body" means
+/// considering both. Any `Transfer-Encoding` is refused outright. The only
+/// client is a fixed SDK that never sends one, so accepting it would buy
+/// nothing and cost both a chunked decoder and the chance that this reader and
+/// an intermediary disagree about where one request ends and the next begins.
+///
+/// A repeated `Content-Length` is refused rather than resolved to its first
+/// value, for the same reason: two different declared lengths are precisely the
+/// disagreement an intermediary could be made to settle the other way.
+pub fn content_length(headers: &str) -> Result<Option<usize>, HttpError> {
+    // A bare LF inside a CRLF-framed block ends the headers for some readers
+    // and not others, so it is never allowed to mean anything here.
+    if headers.ends_with("\r\n\r\n") {
+        let mut previous = 0u8;
+        for byte in headers.bytes() {
+            if byte == b'\n' && previous != b'\r' {
+                return Err(HttpError::MalformedHeader);
+            }
+            previous = byte;
+        }
+    }
+    let mut length = None;
+    for pair in header_lines(headers) {
+        let (name, value) = pair?;
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(HttpError::UnsupportedTransferEncoding);
+        }
+        if !name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        // Digits only, checked before parsing: `usize::from_str` accepts a
+        // leading `+`, which an intermediary need not read the same way.
+        if length.is_some() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(HttpError::BadContentLength);
+        }
+        let parsed: usize = value.parse().map_err(|_| HttpError::BadContentLength)?;
+        if parsed > MAX_BODY_BYTES {
+            return Err(HttpError::TooLarge);
+        }
+        length = Some(parsed);
+    }
+    Ok(length)
+}
+
+/// Everything both request types read out of a header block.
+struct Head {
+    method: String,
+    target: String,
+    host: Option<String>,
+    soap_action: Option<String>,
+    keep_alive: bool,
+    content_type: Option<String>,
+}
+
+/// Parse a complete header block. The body is the caller's business, because
+/// the two public entry points disagree about what a body may contain: one
+/// requires UTF-8, the other carries DIME bytes.
+fn parse_head(headers: &str) -> Result<Head, HttpError> {
+    let first = headers
+        .lines()
+        .next()
+        .ok_or(HttpError::MalformedRequestLine)?;
+    let (method, target, keep_alive) = parse_request_line(first)?;
+    let mut head = Head {
+        method,
+        target,
+        host: None,
+        soap_action: None,
+        keep_alive,
+        content_type: None,
+    };
+    for pair in header_lines(headers) {
+        let (name, value) = pair?;
+        if name.eq_ignore_ascii_case("host") {
+            head.host = Some(value.to_owned());
+        } else if name.eq_ignore_ascii_case("soapaction") {
+            head.soap_action = Some(value.trim_matches('"').to_owned());
+        } else if name.eq_ignore_ascii_case("connection") {
+            head.keep_alive = value.eq_ignore_ascii_case("keep-alive");
+        } else if name.eq_ignore_ascii_case("content-type") {
+            head.content_type = Some(value.to_owned());
+        }
+    }
+    Ok(head)
+}
+
+/// Method, target, and the keep-alive default the version implies.
+///
+/// Exactly three space-separated fields, per RFC 9112. GameSpy's client sends
+/// HTTP/1.1 with an explicit `Connection` header, so 1.1 keep-alive is the
+/// right default when that header is absent. The version is read from the third
+/// field rather than searched for anywhere in the line, so a target such as
+/// `/x?v=HTTP/1.1` on an HTTP/1.0 request can no longer turn keep-alive on.
+fn parse_request_line(line: &str) -> Result<(String, String, bool), HttpError> {
+    let mut fields = line.split(' ');
+    let method = fields.next().unwrap_or_default();
+    let target = fields.next().unwrap_or_default();
+    let version = fields.next().unwrap_or_default();
+    if fields.next().is_some()
+        || !is_token(method)
+        || !method.bytes().all(|byte| byte.is_ascii_uppercase())
+        || target.is_empty()
+        || target.bytes().any(|byte| byte <= b' ' || byte == 0x7f)
+    {
+        return Err(HttpError::MalformedRequestLine);
+    }
+    let keep_alive = match version {
+        "HTTP/1.1" => true,
+        "HTTP/1.0" => false,
+        _ => return Err(HttpError::MalformedRequestLine),
+    };
+    Ok((method.to_owned(), target.to_owned(), keep_alive))
 }
 
 /// Parse a complete request: header block plus exactly `Content-Length` bytes.
@@ -108,49 +257,18 @@ pub fn parse_request(data: &[u8]) -> Result<Request, HttpError> {
     let headers = std::str::from_utf8(&data[..end]).map_err(|_| HttpError::NotUtf8)?;
     let body = std::str::from_utf8(&data[end..]).map_err(|_| HttpError::NotUtf8)?;
 
-    let first = headers
-        .lines()
-        .next()
-        .ok_or(HttpError::MalformedRequestLine)?;
-    let mut parts = first.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or(HttpError::MalformedRequestLine)?
-        .to_owned();
-    let target = parts
-        .next()
-        .ok_or(HttpError::MalformedRequestLine)?
-        .to_owned();
-
-    let mut host = None;
-    let mut soap_action = None;
-    // GameSpy's client sends HTTP/1.1 with an explicit Connection header; when
-    // it is absent, 1.1 keep-alive is the correct default.
-    let mut keep_alive = first.contains("HTTP/1.1");
-    for line in headers.lines().skip(1) {
-        if line.is_empty() {
-            continue;
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            return Err(HttpError::MalformedHeader);
-        };
-        let name = name.trim();
-        let value = value.trim();
-        if name.eq_ignore_ascii_case("host") {
-            host = Some(value.to_owned());
-        } else if name.eq_ignore_ascii_case("soapaction") {
-            soap_action = Some(value.trim_matches('"').to_owned());
-        } else if name.eq_ignore_ascii_case("connection") {
-            keep_alive = value.eq_ignore_ascii_case("keep-alive");
-        }
+    // The same gate the framing layer uses, so this entry point cannot be the
+    // one that accepts a chunked or doubly-declared body.
+    if body.len() != content_length(headers)?.unwrap_or(0) {
+        return Err(HttpError::BadContentLength);
     }
-
+    let head = parse_head(headers)?;
     Ok(Request {
-        method,
-        target,
-        host,
-        soap_action,
-        keep_alive,
+        method: head.method,
+        target: head.target,
+        host: head.host,
+        soap_action: head.soap_action,
+        keep_alive: head.keep_alive,
         body: body.to_owned(),
     })
 }
@@ -183,47 +301,63 @@ pub fn soap_response(body: &str, keep_alive: bool) -> Vec<u8> {
 }
 
 pub fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// Elements with this local name, in document order, as inner text.
+///
+/// Prefixes are ignored, so `ns1:gameid` matches `gameid`, and a self-closing
+/// element yields an empty string. Iteration stops at the first unterminated
+/// tag or unclosed match rather than guessing what a truncated document meant,
+/// so a caller cannot tell "no such element" from "nothing readable left" —
+/// which is what both wrappers below already assumed.
+fn elements<'a>(xml: &'a str, local: &str) -> impl Iterator<Item = &'a str> {
+    let mut cursor = 0;
+    std::iter::from_fn(move || {
+        loop {
+            let relative = xml[cursor..].find('<')?;
+            let start = cursor + relative;
+            let end = start + xml[start..].find('>')?;
+            let tag = &xml[start + 1..end];
+            cursor = end + 1;
+            if tag.starts_with(['/', '?', '!']) {
+                continue;
+            }
+            if tag.ends_with('/') {
+                if local_name(tag.trim_end_matches('/').trim()) == local {
+                    return Some("");
+                }
+                continue;
+            }
+            let name_end = tag
+                .find(|character: char| character.is_whitespace())
+                .unwrap_or(tag.len());
+            if local_name(&tag[..name_end]) == local {
+                let close = find_close(xml, cursor, local)?;
+                let inner = &xml[cursor..close];
+                cursor = close;
+                return Some(inner);
+            }
+        }
+    })
 }
 
 /// Find the first element with this local name and return its inner text.
 /// Prefixes are ignored, so `ns1:gameid` matches `gameid`. This covers the
 /// flat, non-repeating field shapes the GameSpy services use and nothing more.
 pub fn find_element<'a>(xml: &'a str, local: &str) -> Option<&'a str> {
-    let mut cursor = 0;
-    while let Some(relative) = xml[cursor..].find('<') {
-        let start = cursor + relative;
-        let end = start + xml[start..].find('>')?;
-        let tag = &xml[start + 1..end];
-        if tag.starts_with('/') || tag.starts_with('?') || tag.starts_with('!') {
-            cursor = end + 1;
-            continue;
-        }
-        if tag.ends_with('/') {
-            let name = tag.trim_end_matches('/').trim();
-            if local_name(name) == local {
-                return Some("");
-            }
-            cursor = end + 1;
-            continue;
-        }
-        let name_end = tag
-            .find(|character: char| character.is_whitespace())
-            .unwrap_or(tag.len());
-        let name = &tag[..name_end];
-        if local_name(name) == local {
-            let inner_start = end + 1;
-            let close = find_close(xml, inner_start, local)?;
-            return Some(&xml[inner_start..close]);
-        }
-        cursor = end + 1;
-    }
-    None
+    elements(xml, local).next()
 }
 
 /// Every element with this local name, in document order, as inner text.
@@ -233,46 +367,7 @@ pub fn find_element<'a>(xml: &'a str, local: &str) -> Option<&'a str> {
 /// *order* of those is a contract, so they need all of them rather than the
 /// first.
 pub fn find_all_elements<'a>(xml: &'a str, local: &str) -> Vec<&'a str> {
-    let mut found = Vec::new();
-    let mut cursor = 0;
-    while cursor < xml.len() {
-        let Some(relative) = xml[cursor..].find('<') else {
-            break;
-        };
-        let start = cursor + relative;
-        let Some(offset) = xml[start..].find('>') else {
-            break;
-        };
-        let end = start + offset;
-        let tag = &xml[start + 1..end];
-        if tag.starts_with('/') || tag.starts_with('?') || tag.starts_with('!') {
-            cursor = end + 1;
-            continue;
-        }
-        if tag.ends_with('/') {
-            if local_name(tag.trim_end_matches('/').trim()) == local {
-                found.push("");
-            }
-            cursor = end + 1;
-            continue;
-        }
-        let name_end = tag
-            .find(|character: char| character.is_whitespace())
-            .unwrap_or(tag.len());
-        if local_name(&tag[..name_end]) == local {
-            let inner_start = end + 1;
-            match find_close(xml, inner_start, local) {
-                Some(close) => {
-                    found.push(&xml[inner_start..close]);
-                    cursor = close;
-                }
-                None => break,
-            }
-        } else {
-            cursor = end + 1;
-        }
-    }
-    found
+    elements(xml, local).collect()
 }
 
 fn find_close(xml: &str, from: usize, local: &str) -> Option<usize> {

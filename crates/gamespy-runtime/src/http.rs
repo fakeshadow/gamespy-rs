@@ -3,6 +3,14 @@
 //! All public helpers operate on supplied streams, with no hostname, default
 //! port or TLS implementation of their own. See the [crate endpoint table](crate)
 //! for service mappings. HTTP `Host` is request data, not DNS configuration.
+//!
+//! These readers expect to be reached directly rather than through a reverse
+//! proxy or CDN. Framing comes from [`gamespy_proto::http::content_length`],
+//! which refuses every request shape whose body boundary two HTTP
+//! implementations could place differently, so a front end cannot be made to
+//! disagree with this reader about where one request ends. That is the whole
+//! defence: an intermediary is still free to forward something it parsed under
+//! its own rules, and no request shape is rewritten or normalised here.
 use gamespy_proto::http;
 use std::io::{Read, Write};
 // Shared framing and bounds checks for blocking TLS and async TCP readers.

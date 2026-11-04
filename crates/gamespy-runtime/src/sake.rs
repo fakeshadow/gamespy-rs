@@ -77,7 +77,7 @@ pub async fn serve_connection(
 /// Describe a rejected request, including its supplied HTTP `Host` if parsed.
 /// This diagnostic neither validates nor resolves that name.
 pub fn non_storage_summary(raw: &[u8]) -> String {
-    let parsed = http::header_end(raw).and_then(|end| http::parse_request(&raw[..end]).ok());
+    let parsed = http::parse_raw_request(raw).ok();
     match parsed {
         Some(request) => {
             let path = request.target.split('?').next().unwrap_or_default();

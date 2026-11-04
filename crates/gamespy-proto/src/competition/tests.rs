@@ -238,3 +238,22 @@ fn control_request_is_not_confused_with_a_report_or_ticket_verification() {
         Err(Error::MissingReport)
     );
 }
+
+/// The six section lengths are attacker-chosen `u32`s and only three are
+/// pinned by `player_count`, so summing them in `usize` can exceed the range
+/// on a 32-bit target. `overflow-checks` is on in release, so that would be a
+/// panic — and this check runs before the checksum, so no valid MD5 is needed
+/// to reach it. The total must fail the section instead.
+#[test]
+fn an_unrepresentable_section_total_is_refused_not_overflowed() {
+    let mut report = vec![0u8; REPORT_HEADER_BYTES];
+    report[..4].copy_from_slice(&2u32.to_be_bytes()); // protocol version
+    // player_count, team_count, team_keys and lengths[5] all stay zero, which
+    // pins lengths[0..=2] to zero and leaves [3] and [4] free.
+    report[56..60].copy_from_slice(&u32::MAX.to_be_bytes()); // lengths[3]
+    report[60..64].copy_from_slice(&u32::MAX.to_be_bytes()); // lengths[4]
+
+    // Two maxed u32s already exceed a 32-bit usize, which is the overflow.
+    assert!(u32::MAX.checked_add(u32::MAX).is_none());
+    assert_eq!(parse_report(&report), Err(Error::InvalidSection));
+}

@@ -278,10 +278,7 @@ impl<A: Account, R: Random> TokenAuthority<A, R> {
 fn random_hex(random: &impl Random, bytes: usize) -> String {
     let mut buffer = vec![0u8; bytes];
     random.fill(&mut buffer);
-    buffer
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
+    crate::observe::hex(&buffer)
 }
 
 pub trait ProfileAccount: Account {

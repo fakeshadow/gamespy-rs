@@ -53,6 +53,10 @@ pub trait Backend: crate::observe::Observer + Sync {
     type Ticket<'a>: Ticket
     where
         Self: 'a;
+    /// Optional application checks for title-specific numeric login identifiers.
+    fn accepts_login(&self, _login: &gp::LoginRequest, _game_id: i64) -> bool {
+        true
+    }
     fn resolve(&self, token: &str, game_id: i64) -> Option<Self::Record>;
     fn issue_login_ticket_for_peer(
         &self,
@@ -75,26 +79,43 @@ where
     B::Record: Send,
     for<'a> B::Ticket<'a>: Send,
 {
-    tokens.event(
+    spawn_multi_with_listener(vec![(config, tokens)], listener)
+}
+
+/// Select a title by a valid token and challenge response, then keep all profile
+/// lookups and the login-ticket lease on that title's backend for the connection.
+pub fn spawn_multi_with_listener<B: Backend>(
+    routes: Vec<(Config, Arc<B>)>,
+    listener: TcpListener,
+) -> Result<Listener, String>
+where
+    B::Record: Send,
+    for<'a> B::Ticket<'a>: Send,
+{
+    if routes.is_empty() {
+        return Err("GP needs at least one title".into());
+    }
+    routes[0].1.event(
         "gp",
         &format!(
-            "listening on {} (TCP, GPCM presence login)",
-            listener.local_addr().map_err(|error| error.to_string())?
+            "listening on {} (TCP; {} title routes)",
+            listener.local_addr().map_err(|e| e.to_string())?,
+            routes.len()
         ),
     );
-    let shared = Arc::new((config, tokens, AtomicU32::new(1)));
+    let shared = Arc::new((routes, AtomicU32::new(1)));
     crate::tcp::spawn_with_listener(listener, "gp", async move |stream| {
-        serve_connection(&shared.0, shared.1.as_ref(), &shared.2, stream).await
+        serve_connection(&shared.0, &shared.1, stream).await
     })
     .map_err(|error| error.to_string())
 }
 
 async fn serve_connection<B: Backend>(
-    config: &Config,
-    tokens: &B,
+    routes: &[(Config, Arc<B>)],
     sessions: &AtomicU32,
     mut stream: crate::tcp::Connection,
 ) {
+    let tokens = routes[0].1.as_ref();
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(LOGIN_TIMEOUT));
     let peer = stream
@@ -102,7 +123,22 @@ async fn serve_connection<B: Backend>(
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
     tokens.peer_event("gp", peer, "connected");
 
-    let server_challenge = random_hex(tokens, SERVER_CHALLENGE_BYTES);
+    // A backend that cannot produce entropy must not be answered with a
+    // predictable challenge, and must not take the process down either: refuse
+    // the login and close. `fill_random` returning an error is a documented
+    // outcome, so turning it into a panic would abort every process built with
+    // `panic = "abort"`.
+    let server_challenge = match random_hex(tokens, SERVER_CHALLENGE_BYTES) {
+        Ok(challenge) => challenge,
+        Err(error) => {
+            tokens.peer_event(
+                "gp",
+                peer,
+                &format!("no server challenge could be generated ({error}); closing without offering a login"),
+            );
+            return;
+        }
+    };
     let Ok(challenge) = gp::challenge_message(&server_challenge) else {
         return;
     };
@@ -122,7 +158,31 @@ async fn serve_connection<B: Backend>(
             }
         };
     tokens.peer_event("gp", peer, &trace::login(&message));
-    let decision = decide_login(config, tokens, &server_challenge, &message);
+    let mut chosen = None;
+    let mut rejection = gp::error_message(error_code::BAD_PROFILE, "unknown or ambiguous title");
+    for (config, backend) in routes {
+        match decide_login(config, backend.as_ref(), &server_challenge, &message) {
+            LoginDecision::Accept(login) => {
+                if chosen.is_some() {
+                    let _ = stream.write_all(rejection.as_bytes()).await;
+                    return;
+                }
+                chosen = Some((backend.as_ref(), login, config.game_id));
+            }
+            LoginDecision::Reject(error) if routes.len() == 1 => rejection = error,
+            _ => {}
+        }
+    }
+    let Some((tokens, accepted, game_id)) = chosen else {
+        let _ = stream.write_all(rejection.as_bytes()).await;
+        return;
+    };
+    let decision = LoginDecision::Accept(accepted);
+    tokens.peer_event(
+        "gp",
+        peer,
+        &format!("connection bound to game_id={game_id}"),
+    );
     let (_record, _login_ticket, sess_key) = match decision {
         LoginDecision::Accept(accepted) => {
             let AcceptedLogin { record, login } = *accepted;
@@ -289,13 +349,31 @@ async fn serve_session<B: Backend>(
                         .await;
                     continue;
                 }
-                let reply = match tokens.account_for_profile(request.profile_id) {
-                    Some(account) => gp::profile_info_response(
+                // The nickname is the application's, and it may hold one this
+                // protocol cannot carry: over 30 bytes, or containing a space
+                // or a backslash. That is the backend's data to correct, not a
+                // reason to drop a logged-in console, so it is answered as an
+                // error and recorded. The nickname itself is not logged.
+                let stored = tokens.account_for_profile(request.profile_id);
+                let reply = match stored {
+                    Some(account) => match gp::profile_info_response(
                         account.profile_id,
                         request.operation_id,
                         &account.nick,
-                    )
-                    .expect("stored nickname is GP-safe"),
+                    ) {
+                        Ok(reply) => reply,
+                        Err(error) => {
+                            tokens.peer_event(
+                                "gp",
+                                peer,
+                                &format!(
+                                    "profile {} has a stored nickname this protocol cannot carry ({error:?}); answered with an error",
+                                    request.profile_id
+                                ),
+                            );
+                            gp::profile_info_error(request.operation_id, "Profile unavailable")
+                        }
+                    },
                     None => gp::profile_info_error(request.operation_id, "Unknown profile"),
                 };
                 if stream.write_all(reply.as_bytes()).await.is_err() {
@@ -386,6 +464,12 @@ pub fn decide_login<B: Backend>(
             "wrong game name",
         ));
     }
+    if !tokens.accepts_login(&login, config.game_id) {
+        return LoginDecision::Reject(gp::error_message(
+            error_code::BAD_PROFILE,
+            "title identifiers disagree",
+        ));
+    }
     let record = match tokens.resolve(&login.auth_token, config.game_id) {
         Some(record) => record,
         None => {
@@ -431,15 +515,18 @@ pub async fn read_message(
     buffered: &mut Vec<u8>,
 ) -> Option<String> {
     let mut chunk = [0u8; 2048];
+    // Bytes already known to hold no terminator. Without this a message that
+    // arrives in many chunks is searched from offset zero once per read.
+    let mut scanned = 0;
     loop {
-        if let Some(end) = gp::find_message_end(buffered) {
-            let message = String::from_utf8(buffered[..end].to_vec()).ok();
-            buffered.drain(..end);
-            return message;
+        if let Some(end) = gp::find_message_end(&buffered[scanned..]) {
+            return String::from_utf8(buffered.drain(..scanned + end).collect()).ok();
         }
         if buffered.len() > gp::MAX_MESSAGE_BYTES {
             return None;
         }
+        // Keep back enough for a terminator split across this read and the next.
+        scanned = buffered.len().saturating_sub(gp::MESSAGE_END.len() - 1);
         let read = stream.read(&mut chunk).await.ok()?;
         if read == 0 {
             return None;
@@ -448,11 +535,14 @@ pub async fn read_message(
     }
 }
 
-pub fn random_hex(tokens: &impl Backend, bytes: usize) -> String {
+/// Lowercase hex from the backend's entropy source.
+///
+/// The backend's error is returned rather than panicked on: a predictable
+/// challenge would let one console redeem another's login, so a failure has to
+/// refuse the exchange — but a library cannot decide to end its caller's
+/// process, which is what a panic means under `panic = "abort"`.
+pub fn random_hex(tokens: &impl Backend, bytes: usize) -> Result<String, String> {
     let mut buffer = vec![0u8; bytes];
-    tokens.fill_random(&mut buffer).expect("CSPRNG unavailable");
-    buffer
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
+    tokens.fill_random(&mut buffer)?;
+    Ok(observe::hex(&buffer))
 }

@@ -24,6 +24,50 @@ pub struct ShutdownConfig {
     pub runtime_timeout: Duration,
 }
 
+/// Pause before an accept retry that would otherwise make no progress.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// When the accept loop should try again after a failed accept.
+///
+/// There is no variant for giving up. A listener that stops accepting serves
+/// nothing for the rest of the process, and one descriptor spike should not
+/// cost the service its life, so the loop ends only on the stop signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptRetry {
+    /// At once, because the failure consumed the connection it concerned: the
+    /// next accept takes the one behind it, so retrying makes progress.
+    Now,
+    /// After a pause, because nothing was consumed and nothing has changed, so
+    /// an immediate retry would be a pure spin.
+    AfterPause,
+}
+
+/// Whether a failed accept made progress through the backlog.
+///
+/// This is the distinction that matters, not whether the error was "about one
+/// connection". Both halves are chosen against a hostile peer:
+///
+/// - A peer can produce [`io::ErrorKind::ConnectionAborted`] at will by
+///   resetting between SYN and accept. The queued connection is consumed
+///   either way, so draining as fast as the kernel reports them is what gets
+///   legitimate peers served. Pacing these would let a flood of cheap resets
+///   throttle every other peer — the attacker sets the accept rate, and a
+///   successful accept, the thing that would end the pacing, is itself stuck
+///   behind it.
+/// - Descriptor exhaustion is the opposite: the connection stays queued, no
+///   descriptor is available, and the failure repeats immediately. Spinning
+///   starves the handlers whose completion would release a descriptor, so a
+///   pause is what allows recovery. An attacker who has exhausted descriptors
+///   has already denied service; burning the CPU as well only prolongs it.
+fn accept_retry(error: &io::Error) -> AcceptRetry {
+    match error.kind() {
+        io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::Interrupted => AcceptRetry::Now,
+        _ => AcceptRetry::AfterPause,
+    }
+}
+
 impl Default for ShutdownConfig {
     fn default() -> Self {
         Self {
@@ -163,6 +207,16 @@ where
 
 /// Start a listener with an explicit best-effort shutdown policy.
 /// DNS and port selection follow [`spawn_with_listener`]; `name` is only a label.
+///
+/// No accept error ends the listener. A failure that consumed its queued
+/// connection, such as a peer resetting before accept returns, is retried at
+/// once so a flood of cheap resets cannot throttle other peers; a failure that
+/// consumed nothing, descriptor exhaustion above all, waits 50 ms so the
+/// handlers whose exit frees a descriptor get the CPU. The accept loop
+/// therefore ends only on the stop signal, and the listener outlives a
+/// descriptor spike instead of silently serving nothing afterwards. Nothing is
+/// logged, because this transport has no observer, which is also why the loop
+/// does not decide for itself that a socket is finished.
 pub fn spawn_with_listener_and_config<F>(
     listener: TcpListener,
     name: &'static str,
@@ -197,8 +251,21 @@ where
                             let worker = tokio::spawn(run_connection(future, stop.clone(), config.grace_period));
                             workers.push((stop, worker));
                         }
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
+                        Err(error) => match accept_retry(&error) {
+                            AcceptRetry::Now => continue,
+                            AcceptRetry::AfterPause => {
+                                // Still interruptible: a shutdown during the
+                                // pause must not wait it out.
+                                let stopped = tokio::select! {
+                                    biased;
+                                    _ = signal.cancelled() => true,
+                                    () = tokio::time::sleep(ACCEPT_RETRY_DELAY) => false,
+                                };
+                                if stopped {
+                                    break;
+                                }
+                            }
+                        },
                     }
                 }
             }

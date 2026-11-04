@@ -1,5 +1,7 @@
 //! Natneg.
 
+use std::net::{Ipv4Addr, SocketAddrV4};
+
 /// The six bytes every negotiation packet begins with.
 ///
 /// Compiled into this binary at `0x01861728` and compared with a six-byte
@@ -60,21 +62,52 @@ impl std::fmt::Display for NatNegError {
 /// Body fields after the header come from the builder at `0x00ae2798`:
 /// offset 12 is the port type the peer is announcing (it sends one INIT per
 /// type), 13 is its client index, and 14 is a flag it sets when its socket is
-/// usable (`0x00ae2844`-`0x00ae2850`). The local address that follows is not
-/// used by this service: the address that matters is the one the datagram
-/// arrived from, which is the peer's public address.
+/// usable (`0x00ae2844`-`0x00ae2850`). Offsets 15..21 carry the peer's own
+/// view of its address: four bytes of IPv4 then a big-endian port.
+///
+/// The public address — the one the datagram arrived from — is what a CONNECT
+/// carries. [`Init::local_address`] is kept alongside it because the two
+/// together are the only way to tell the hard case apart: when both peers
+/// reach this service from the *same* public address they are behind one NAT,
+/// and the address they can actually reach each other on is the private one.
+/// Nothing in this crate acts on that yet; it is parsed so a listener can
+/// record it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Init {
     pub cookie: u32,
     pub port_type: u8,
     pub client_index: u8,
     pub use_game_port: bool,
+    /// The peer's own view of its address, offsets 15..21. `None` when the
+    /// INIT is too short to carry it; `Some` with an unspecified address or a
+    /// zero port when the peer sent a placeholder, which is reported as
+    /// received rather than normalised away.
+    pub local_address: Option<SocketAddrV4>,
 }
 
 /// A parsed negotiation packet.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Packet {
     Init(Init),
+}
+
+/// Offset of the peer's own address inside an INIT body.
+pub const LOCAL_ADDRESS_OFFSET: usize = 15;
+
+/// Length of an INIT that carries a complete local address.
+pub const INIT_WITH_ADDRESS_LEN: usize = LOCAL_ADDRESS_OFFSET + 6;
+
+/// Read the local address an INIT announces, offsets 15..21.
+///
+/// Returns `None` only when the datagram is too short to hold it. The value is
+/// passed through exactly as sent: a peer that fills it with zeroes is
+/// reporting that, and anything instrumenting a negotiation needs to tell
+/// "absent" from "sent as zero".
+pub fn local_address_of(datagram: &[u8]) -> Option<SocketAddrV4> {
+    let bytes = datagram.get(LOCAL_ADDRESS_OFFSET..INIT_WITH_ADDRESS_LEN)?;
+    let address = Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
+    let port = u16::from_be_bytes([bytes[4], bytes[5]]);
+    Some(SocketAddrV4::new(address, port))
 }
 
 /// Read the cookie out of any negotiation packet.
@@ -111,11 +144,13 @@ pub fn parse(datagram: &[u8]) -> Result<Packet, NatNegError> {
             let port_type = datagram.get(12).copied().unwrap_or(0);
             let client_index = datagram.get(13).copied().unwrap_or(0);
             let use_game_port = datagram.get(14).copied().unwrap_or(0) != 0;
+            let local_address = local_address_of(datagram);
             Ok(Packet::Init(Init {
                 cookie,
                 port_type,
                 client_index,
                 use_game_port,
+                local_address,
             }))
         }
         other => Err(NatNegError::UnhandledType(other)),
@@ -148,3 +183,115 @@ pub fn connect(cookie: u32, peer_address: [u8; 4], peer_port: u16) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests;
+
+/// Characters a routing name may contain.
+///
+/// A game name reaches this service as part of a composed host name
+/// (`{game}.natneg1.gamespy.com`), so it is a DNS label: ASCII alphanumerics
+/// and `-`. Underscore is accepted alongside them because published GameSpy
+/// game names use it.
+///
+/// This is a whitelist rather than a pass-through because the name is logged
+/// and used as a map key, so control bytes have no business in it. It is not
+/// authentication: a name is a claim, and only a name matching a configured
+/// title is served.
+pub fn is_routing_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+}
+
+/// Why a datagram was not accepted as a named INIT.
+///
+/// Every check [`parse_named_init_detailed`] makes has a variant here, because
+/// a title-routing listener drops a datagram it cannot name and a drop with no
+/// reason is indistinguishable from a peer that never sent anything.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum NamedInitRefusal {
+    /// Shorter than a header plus a local address plus a one-byte name.
+    TooShort(usize),
+    /// Parsed, but not an INIT.
+    NotInit(NatNegError),
+    /// No NUL anywhere after the local address.
+    Unterminated,
+    /// The name is the empty string.
+    EmptyName,
+    /// Longer than the 63 bytes this accepts.
+    NameTooLong(usize),
+    /// A NUL-terminated name followed by further bytes.
+    TrailingBytes(usize),
+    /// The name is not UTF-8.
+    NotUtf8,
+    /// A character outside [`is_routing_name_byte`], which this refuses.
+    DisallowedCharacter(char),
+}
+
+impl std::fmt::Display for NamedInitRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooShort(length) => {
+                write!(formatter, "{length} bytes is too short for a named init")
+            }
+            Self::NotInit(error) => write!(formatter, "not an init: {error}"),
+            Self::Unterminated => formatter.write_str("no NUL terminating the title name"),
+            Self::EmptyName => formatter.write_str("empty title name"),
+            Self::NameTooLong(length) => write!(formatter, "title name is {length} bytes"),
+            Self::TrailingBytes(count) => {
+                write!(formatter, "{count} bytes after the title name's NUL")
+            }
+            Self::NotUtf8 => formatter.write_str("title name is not UTF-8"),
+            Self::DisallowedCharacter(character) => write!(
+                formatter,
+                "title name contains {character:?}, which a routing name may not contain"
+            ),
+        }
+    }
+}
+
+/// INIT routing metadata: the negotiation fields plus the title name the peer
+/// names itself with. Legacy `parse` remains available to existing
+/// single-title embedders. A routing name is a claim, not authentication.
+///
+/// **The protocol version is not a gate here.** [`parse`] ignores it, and so
+/// does this: what a routing name needs is the body *layout*, and the checks
+/// below validate that directly — a complete local address, then a
+/// NUL-terminated name of permitted characters that is the datagram's last
+/// field. A datagram whose layout differs fails those checks and is refused
+/// with the reason, which is strictly more informative than refusing every
+/// version but one. Only version 4's layout is evidenced in this project;
+/// gating on it as well would reject other generations without ever reading
+/// whether their body agrees.
+pub fn parse_named_init(datagram: &[u8]) -> Option<(Init, &str)> {
+    parse_named_init_detailed(datagram).ok()
+}
+
+/// [`parse_named_init`], but saying which check refused the datagram.
+///
+/// Same acceptance rule; only the failure is described. Use this where a
+/// refusal has to be recorded rather than counted.
+pub fn parse_named_init_detailed(datagram: &[u8]) -> Result<(Init, &str), NamedInitRefusal> {
+    if datagram.len() < 23 {
+        return Err(NamedInitRefusal::TooShort(datagram.len()));
+    }
+    let Packet::Init(init) = parse(datagram).map_err(NamedInitRefusal::NotInit)?;
+    let tail = &datagram[21..];
+    let end = tail
+        .iter()
+        .position(|b| *b == 0)
+        .ok_or(NamedInitRefusal::Unterminated)?;
+    if end == 0 {
+        return Err(NamedInitRefusal::EmptyName);
+    }
+    if end > 63 {
+        return Err(NamedInitRefusal::NameTooLong(end));
+    }
+    if end + 1 != tail.len() {
+        return Err(NamedInitRefusal::TrailingBytes(tail.len() - end - 1));
+    }
+    let name = std::str::from_utf8(&tail[..end]).map_err(|_| NamedInitRefusal::NotUtf8)?;
+    if let Some(character) = name
+        .chars()
+        .find(|c| !c.is_ascii() || !is_routing_name_byte(*c as u8))
+    {
+        return Err(NamedInitRefusal::DisallowedCharacter(character));
+    }
+    Ok((init, name))
+}

@@ -1,6 +1,7 @@
 //! Sake.
 
 use crate::http;
+use std::fmt::Write as _;
 
 /// Status strings the client maps to its own result codes (`0x00accaf4`).
 pub const RESULT_SUCCESS: &str = "Success";
@@ -123,18 +124,22 @@ pub fn build_search_response(field_count: usize, records: &[Vec<Value>]) -> Opti
         values.push_str("<ArrayOfRecordValue>");
         for value in record {
             let element = value.element();
-            values.push_str(&format!(
+            let _ = write!(
+                values,
                 "<RecordValue><{element}><value>{}</value></{element}></RecordValue>",
                 value.text()
-            ));
+            );
         }
         values.push_str("</ArrayOfRecordValue>");
     }
 
-    Some(envelope(&format!(
-        "<SearchForRecordsResult>{RESULT_SUCCESS}</SearchForRecordsResult>\
-         <values>{values}</values>"
-    )))
+    Some(envelope(
+        "SearchForRecords",
+        &format!(
+            "<SearchForRecordsResult>{RESULT_SUCCESS}</SearchForRecordsResult>\
+             <values>{values}</values>"
+        ),
+    ))
 }
 
 /// Build an answer that carries a status other than `Success` and no values.
@@ -143,20 +148,25 @@ pub fn build_search_response(field_count: usize, records: &[Vec<Value>]) -> Opti
 /// this service has to say about a player nothing has ever stored anything
 /// for.
 pub fn build_search_status(status: &str) -> String {
-    envelope(&format!(
-        "<SearchForRecordsResult>{}</SearchForRecordsResult>",
-        http::escape_xml(status)
-    ))
+    envelope(
+        "SearchForRecords",
+        &format!(
+            "<SearchForRecordsResult>{}</SearchForRecordsResult>",
+            http::escape_xml(status)
+        ),
+    )
 }
 
-fn envelope(body: &str) -> String {
+/// The envelope every answer shares. `operation` names the response element,
+/// which is the only part that differs between a search and a write.
+fn envelope(operation: &str, body: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
          <soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" \
          xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
          xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">\
-         <soap:Body><SearchForRecordsResponse xmlns=\"{NAMESPACE}\">{body}\
-         </SearchForRecordsResponse></soap:Body></soap:Envelope>"
+         <soap:Body><{operation}Response xmlns=\"{NAMESPACE}\">{body}\
+         </{operation}Response></soap:Body></soap:Envelope>"
     )
 }
 
@@ -432,8 +442,8 @@ fn parse_write_field(entry: roxmltree::Node<'_, '_>) -> Option<WriteField> {
 /// a missing one is a parse error on its side (`0x00acd584`-`0x00acd5b8`), so
 /// the id is not optional.
 pub fn build_create_response(record_id: u32) -> String {
-    write_envelope(
-        WriteOperation::Create,
+    envelope(
+        WriteOperation::Create.element(),
         &format!(
             "<CreateRecordResult>{RESULT_SUCCESS}</CreateRecordResult>\
              <recordid>{record_id}</recordid>"
@@ -443,33 +453,21 @@ pub fn build_create_response(record_id: u32) -> String {
 
 /// Build the answer to an `UpdateRecord`.
 pub fn build_update_response() -> String {
-    write_envelope(
-        WriteOperation::Update,
+    envelope(
+        WriteOperation::Update.element(),
         &format!("<UpdateRecordResult>{RESULT_SUCCESS}</UpdateRecordResult>"),
     )
 }
 
 /// Build a non-success answer to a write.
 pub fn build_write_status(operation: WriteOperation, status: &str) -> String {
-    write_envelope(
-        operation,
+    envelope(
+        operation.element(),
         &format!(
             "<{0}Result>{1}</{0}Result>",
             operation.element(),
             http::escape_xml(status)
         ),
-    )
-}
-
-fn write_envelope(operation: WriteOperation, body: &str) -> String {
-    let element = operation.element();
-    format!(
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
-         <soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" \
-         xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
-         xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">\
-         <soap:Body><{element}Response xmlns=\"{NAMESPACE}\">{body}\
-         </{element}Response></soap:Body></soap:Envelope>"
     )
 }
 

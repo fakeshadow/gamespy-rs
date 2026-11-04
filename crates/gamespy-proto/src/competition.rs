@@ -1,5 +1,7 @@
 //! Competition.
 
+use crate::http::escape_xml;
+
 pub const PATH: &str = "/CompetitionService/CompetitionService.asmx";
 pub const ATLAS_PATH: &str = "/AtlasDataServices/GameConfig.asmx";
 pub const NAMESPACE: &str = "http://gamespy.net/competition/";
@@ -252,15 +254,6 @@ pub fn format_guid(value: &[u8; 16]) -> String {
     text
 }
 
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 fn response(operation: Operation, fields: &str) -> String {
     let name = operation.name();
     format!(
@@ -287,8 +280,8 @@ pub fn build_create_response(
         operation,
         &format!(
             "<result>{result}</result><csid>{}</csid><ccid>{}</ccid>",
-            xml_escape(csid),
-            xml_escape(ccid)
+            escape_xml(csid),
+            escape_xml(ccid)
         ),
     ))
 }
@@ -297,7 +290,7 @@ pub fn build_create_response(
 pub fn build_intention_response(result: u32, ccid: &str) -> String {
     response(
         Operation::SetReportIntention,
-        &format!("<result>{result}</result><ccid>{}</ccid>", xml_escape(ccid)),
+        &format!("<result>{result}</result><ccid>{}</ccid>", escape_xml(ccid)),
     )
 }
 
@@ -403,16 +396,28 @@ pub fn parse_report(bytes: &[u8]) -> Result<Report, Error> {
     if team_count != 0 || team_keys != 0 || lengths[5] != 0 {
         return Err(Error::UnsupportedTeams);
     }
+    // The declared lengths are six attacker-chosen u32 values and only three
+    // of them are pinned by `player_count`, so a plain sum can exceed usize on
+    // a 32-bit target. `overflow-checks` is on in release, so that would be a
+    // panic reached before the checksum is even computed. Fail the section
+    // instead: an unrepresentable total cannot match a real body length.
+    let declared_total = lengths
+        .iter()
+        .try_fold(0usize, |total, length| total.checked_add(*length));
     if lengths[0] != player_count * 20
         || lengths[1] != player_count * 16
         || lengths[2] != player_count * 4
-        || lengths.iter().sum::<usize>() != bytes.len() - REPORT_HEADER_BYTES
+        || declared_total != Some(bytes.len() - REPORT_HEADER_BYTES)
     {
         return Err(Error::InvalidSection);
     }
-    let mut hashed = bytes.to_vec();
-    hashed[8..24].fill(0);
-    if md5::compute(&hashed).0 != checksum {
+    // The checksum field is zeroed for the digest. Feeding the three spans
+    // around it keeps a 64 KiB report from being copied once per submission.
+    let mut digest = md5::Context::new();
+    digest.consume(&bytes[..8]);
+    digest.consume([0u8; 16]);
+    digest.consume(&bytes[24..]);
+    if digest.finalize().0 != checksum {
         return Err(Error::InvalidChecksum);
     }
     let mut all = Cursor::new(&bytes[REPORT_HEADER_BYTES..]);

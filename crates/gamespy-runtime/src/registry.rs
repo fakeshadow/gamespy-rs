@@ -160,15 +160,14 @@ impl<P: Policy> SessionRegistry<P> {
     /// message is one unacknowledged datagram and may never arrive.
     pub fn sweep(&mut self, now: Instant) -> Vec<SessionId> {
         let ttl = self.ttl;
-        let expired: Vec<SessionId> = self
-            .entries
-            .iter()
-            .filter(|(_, entry)| now.duration_since(entry.last_seen) > ttl)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in &expired {
-            self.entries.remove(id);
-        }
+        let mut expired = Vec::new();
+        self.entries.retain(|id, entry| {
+            let live = now.duration_since(entry.last_seen) <= ttl;
+            if !live {
+                expired.push(*id);
+            }
+            live
+        });
         expired
     }
 

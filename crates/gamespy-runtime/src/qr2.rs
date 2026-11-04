@@ -46,6 +46,22 @@ pub fn handle(
                     datagram.len()
                 ),
             );
+            // An unhandled type is a packet the host chose to send us, and
+            // the relay that starts a negotiation is the one exchange here
+            // with no acknowledgement wired up. If a host answers it with a
+            // type this build does not know, that answer is otherwise
+            // invisible, so the bytes go on the record.
+            if let qr2::Qr2Error::UnknownType(packet_type) = error {
+                registry.peer_event(
+                    "qr2",
+                    peer,
+                    &format!(
+                        "drop trace: host sent type {packet_type:#04x}, which this build does \
+                         not handle; recording it rather than discarding it"
+                    ),
+                );
+                registry.bytes("qr2", peer, "unhandled host packet", datagram, 512);
+            }
             return false;
         }
     };
@@ -196,6 +212,22 @@ pub fn handle(
                     }
                 ),
             );
+            // A host echoing back the type we relayed is the only signal that
+            // it received the message that starts a negotiation. Nothing
+            // matches it to the relay or stops a retry, so it is called out
+            // by name here rather than read as a generic reply.
+            if packet_type == qr2::packet_type::CLIENT_MESSAGE {
+                registry.peer_event(
+                    "qr2",
+                    peer,
+                    &format!(
+                        "relay trace: host echoed the client message (type {packet_type:#04x}) \
+                         with {} payload bytes; treated as diagnostics only, not as an \
+                         acknowledgement",
+                        payload.len()
+                    ),
+                );
+            }
             // The bytes, not just the length. A challenge reply was read
             // statically as carrying no payload at all, and a real host sent
             // 21 bytes — so what is in there has to be on the record.
@@ -209,22 +241,34 @@ pub fn handle(
 
 /// Turn a heartbeat's key block into what the registry stores.
 fn session_data_from(peer: SocketAddr, keys: &qr2::KeyBlock<'_>) -> SessionData {
-    let pairs: Vec<_> = keys
+    let pairs: Vec<(String, String)> = keys
         .pairs()
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
+    // Read the routing fields out of the collected pairs: `KeyBlock::get`
+    // re-splits the block and re-validates its UTF-8 from the start on every
+    // call, and a heartbeat needs four of them.
+    let field = |wanted: &str| {
+        pairs
+            .iter()
+            .find(|(key, _)| key == wanted)
+            .map(|(_, value)| value.as_str())
+    };
+    // In preference order, because a console sends only some of these: the
+    // attempt-6 heartbeats had `hostport` and `localport` and no `publicport`
+    // whatsoever.
+    let advertised_port = ["publicport", "hostport", "localport"]
+        .iter()
+        .find_map(|key| field(key).and_then(|value| value.parse().ok()))
+        .unwrap_or(0);
+    let local_port = field("localport").and_then(|value| value.parse().ok());
+    let natneg = field("natneg") == Some("1");
     SessionData {
         preferences: (),
         source: peer,
-        // In preference order, because a console sends only some of these:
-        // the attempt-6 heartbeats had `hostport` and `localport` and no
-        // `publicport` whatsoever.
-        advertised_port: ["publicport", "hostport", "localport"]
-            .iter()
-            .find_map(|key| keys.get(key).and_then(|value| value.parse().ok()))
-            .unwrap_or(0),
-        local_port: keys.get("localport").and_then(|value| value.parse().ok()),
-        natneg: keys.get("natneg") == Some("1"),
+        advertised_port,
+        local_port,
+        natneg,
         keys: pairs,
     }
 }

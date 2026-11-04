@@ -56,6 +56,23 @@ pub struct LoginRequest {
 /// fields are length- and syntax-checked.
 pub fn parse_login(message: &str) -> Result<LoginRequest, GpError> {
     let message = parse_fields(message)?;
+    for key in [
+        "gamename",
+        "authtoken",
+        "productid",
+        "namespaceid",
+        "partnerid",
+    ] {
+        if message
+            .values
+            .iter()
+            .filter(|(name, _)| *name == key)
+            .count()
+            > 1
+        {
+            return Err(GpError::InvalidField(key));
+        }
+    }
     if message.command != "login" {
         return Err(GpError::UnexpectedCommand);
     }
@@ -73,12 +90,12 @@ pub fn parse_login(message: &str) -> Result<LoginRequest, GpError> {
         user_challenge: user_challenge.to_owned(),
         auth_token: auth_token.to_owned(),
         client_response: optional_owned(&message, "response"),
-        partner_id: optional_i32(&message, "partnerid")?,
-        product_id: optional_i32(&message, "productid")?,
-        namespace_id: optional_i32(&message, "namespaceid")?,
-        sdk_revision: optional_i32(&message, "sdkrevision")?,
-        quiet: optional_i32(&message, "quiet")?,
-        port: optional_u16(&message, "port")?,
+        partner_id: optional_number(&message, "partnerid")?,
+        product_id: optional_number(&message, "productid")?,
+        namespace_id: optional_number(&message, "namespaceid")?,
+        sdk_revision: optional_number(&message, "sdkrevision")?,
+        quiet: optional_number(&message, "quiet")?,
+        port: optional_number(&message, "port")?,
         game_name: optional_owned(&message, "gamename"),
         user: optional_owned(&message, "user"),
         unique_nick: optional_owned(&message, "uniquenick"),
@@ -378,17 +395,12 @@ fn optional_owned(message: &Fields<'_>, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn optional_i32(message: &Fields<'_>, key: &'static str) -> Result<Option<i32>, GpError> {
-    match value(message, key).filter(|found| !found.is_empty()) {
-        Some(found) => found
-            .parse()
-            .map(Some)
-            .map_err(|_| GpError::InvalidField(key)),
-        None => Ok(None),
-    }
-}
-
-fn optional_u16(message: &Fields<'_>, key: &'static str) -> Result<Option<u16>, GpError> {
+/// An absent or empty field is `None`; present but unparseable in the target
+/// type (a negative `port`, say) is rejected rather than defaulted.
+fn optional_number<T: std::str::FromStr>(
+    message: &Fields<'_>,
+    key: &'static str,
+) -> Result<Option<T>, GpError> {
     match value(message, key).filter(|found| !found.is_empty()) {
         Some(found) => found
             .parse()

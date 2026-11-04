@@ -1,11 +1,11 @@
 //! Availability listener.
 //!
 //! Endpoint names and ports are documented on [`spawn_with_socket`]. The
-//! [`answer`] and [`describe`] helpers process packets without opening sockets
-//! or resolving names; they use the same availability protocol.
+//! [`answer`] helper processes packets without opening sockets or resolving
+//! names; it uses the same availability protocol.
 
 use crate::listener::{Listener, StopSignal};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::UdpSocket;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -52,6 +52,27 @@ pub fn spawn_with_socket(
     registry: SharedRegistry,
     socket: UdpSocket,
 ) -> Result<Listener, String> {
+    spawn_routes(vec![(game_name, registry)], socket, false)
+}
+
+/// Shared availability/QR2 endpoint. Heartbeats select a registry by gamename;
+/// subsequent packets require an unambiguous live source socket/instance binding.
+pub fn spawn_multi_with_socket(
+    routes: Vec<(String, SharedRegistry)>,
+    socket: UdpSocket,
+) -> Result<Listener, String> {
+    spawn_routes(routes, socket, true)
+}
+
+fn spawn_routes(
+    routes: Vec<(String, SharedRegistry)>,
+    socket: UdpSocket,
+    strict: bool,
+) -> Result<Listener, String> {
+    let registry = &routes
+        .first()
+        .ok_or("availability needs at least one title")?
+        .1;
     registry.event(
         "availability",
         &format!(
@@ -81,7 +102,7 @@ pub fn spawn_with_socket(
                 tokio::select! {
                     biased;
                     _ = signal.cancelled() => {},
-                    _ = serve(&socket, &qr2_socket, &game_name, &registry) => {},
+                    _ = serve(&socket, &qr2_socket, &routes, strict) => {},
                 }
             });
         })
@@ -95,9 +116,10 @@ pub fn spawn_with_socket(
 async fn serve(
     socket: &tokio::net::UdpSocket,
     qr2_socket: &UdpSocket,
-    game_name: &str,
-    registry: &SharedRegistry,
+    routes: &[(String, SharedRegistry)],
+    strict: bool,
 ) {
+    let registry = &routes[0].1;
     let mut buffer = vec![0u8; MAX_DATAGRAM];
     let mut sweeps = tokio::time::interval(SWEEP_INTERVAL);
     sweeps.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -105,7 +127,7 @@ async fn serve(
         let received = tokio::select! {
             biased;
             _ = sweeps.tick() => {
-                sweep(registry);
+                for (_, registry) in routes { sweep(registry); }
                 continue;
             },
             received = socket.recv_from(&mut buffer) => received,
@@ -125,24 +147,31 @@ async fn serve(
                 continue;
             }
         };
-        sweep(registry);
         let datagram = &buffer[..length];
-        match answer(datagram, game_name) {
+        let available = routes.iter().find_map(|(name, _)| answer(datagram, name));
+        match available {
             Some(reply) => {
                 let sent = socket.send_to(&reply, peer).await;
                 registry.peer_event(
                     "availability",
                     peer,
                     &match sent {
-                        Ok(_) => format!("probe for {game_name} answered available"),
-                        Err(error) => format!("probe for {game_name} answer failed: {error}"),
+                        Ok(_) => "probe answered available".to_owned(),
+                        Err(error) => format!("probe answer failed: {error}"),
                     },
                 );
             }
             // Either another title's probe or the other protocol on this
             // port. QR2 is served; anything else is recorded and unanswered.
             None => {
-                if !qr2_handler::handle(qr2_socket, peer, datagram, registry) {
+                let selected = if strict {
+                    route_qr2(routes, peer, datagram, Instant::now())
+                } else {
+                    Some(0)
+                };
+                if selected.is_none_or(|index| {
+                    !qr2_handler::handle(qr2_socket, peer, datagram, &routes[index].1)
+                }) {
                     registry.bytes(
                         "availability",
                         peer,
@@ -170,15 +199,6 @@ pub fn answer(datagram: &[u8], game_name: &str) -> Option<[u8; 7]> {
     Some(availability::response(availability::SERVICE_AVAILABLE))
 }
 
-/// Log line for a received probe, kept out of [`answer`] so the decision stays
-/// testable without I/O.
-pub fn describe(datagram: &[u8], peer: SocketAddr) -> String {
-    match availability::parse_probe(datagram) {
-        Ok(name) => format!("availability probe from {peer} for {name}"),
-        Err(error) => format!("availability probe from {peer} rejected: {error:?}"),
-    }
-}
-
 /// Drop sessions whose deadline has passed, logging each with its reason.
 fn sweep(registry: &SharedRegistry) {
     let expired = registry.sweep(Instant::now());
@@ -190,5 +210,76 @@ fn sweep(registry: &SharedRegistry) {
                 id.peer_ip, id.instance_key
             ),
         );
+    }
+}
+
+/// Resolve only declared titles or existing exact socket bindings. The source IP
+/// alone is insufficient: two hosts can share a NAT and an instance key.
+fn route_qr2(
+    routes: &[(String, SharedRegistry)],
+    peer: std::net::SocketAddr,
+    datagram: &[u8],
+    now: Instant,
+) -> Option<usize> {
+    use gamespy_proto::qr2::{HostPacket, parse_host_packet};
+    let packet = parse_host_packet(datagram).ok()?;
+    let (key, name, exiting) = match &packet {
+        HostPacket::Heartbeat { instance_key, keys } => {
+            keys.validate().ok()?;
+            let mut names = keys
+                .pairs()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("gamename"));
+            let name = names.next().map(|(_, v)| v);
+            if names.next().is_some() {
+                return None;
+            }
+            (*instance_key, name, keys.is_exiting())
+        }
+        HostPacket::Keepalive { instance_key } | HostPacket::Reply { instance_key, .. } => {
+            (*instance_key, None, true)
+        }
+    };
+    let id = crate::registry::SessionId::new(peer, key);
+    let existing: Vec<_> = routes
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, r))| {
+            r.listable(now)
+                .iter()
+                .any(|(held, data)| *held == id && data.source == peer)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if let Some(name) = name {
+        let matches: Vec<_> = routes
+            .iter()
+            .enumerate()
+            .filter(|(_, (n, _))| n.eq_ignore_ascii_case(name))
+            .map(|(i, _)| i)
+            .collect();
+        let [selected] = matches.as_slice() else {
+            return None;
+        };
+        if existing.iter().any(|i| i != selected) {
+            return None;
+        }
+        // The legacy per-title registry keys IP/instance, so do not overwrite a
+        // different live source socket using that same identity.
+        if routes[*selected]
+            .1
+            .listable(now)
+            .iter()
+            .any(|(held, data)| *held == id && data.source != peer)
+        {
+            return None;
+        }
+        Some(*selected)
+    } else if exiting {
+        match existing.as_slice() {
+            [index] => Some(*index),
+            _ => None,
+        }
+    } else {
+        None
     }
 }

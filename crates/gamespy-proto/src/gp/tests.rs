@@ -246,3 +246,23 @@ fn message_end_is_found_after_the_terminator() {
     assert_eq!(find_message_end(b"\\ka\\\\final\\rest"), Some(11));
     assert_eq!(find_message_end(b"\\ka\\\\fin"), None);
 }
+
+#[test]
+fn duplicate_title_selectors_do_not_silently_choose_the_first() {
+    let base = "\\login\\\\challenge\\CLIENT\\authtoken\\token\\response\\01234567890123456789012345678901";
+    for (key, value) in [
+        ("gamename", "alpha"),
+        ("authtoken", "token"),
+        ("productid", "1"),
+        ("namespaceid", "1"),
+        ("partnerid", "1"),
+    ] {
+        let fields = if key == "authtoken" {
+            format!("\\{key}\\{value}")
+        } else {
+            format!("\\{key}\\{value}\\{key}\\{value}")
+        };
+        let message = format!("{base}{fields}\\final\\");
+        assert_eq!(parse_login(&message), Err(GpError::InvalidField(key)));
+    }
+}

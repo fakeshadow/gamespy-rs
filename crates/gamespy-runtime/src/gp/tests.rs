@@ -133,3 +133,209 @@ async fn excessive_prelogin_keepalives_are_bounded() {
         Err(LoginReadError::KeepaliveLimit)
     );
 }
+
+/// `read_message` rescans only the bytes a new read could have completed, so
+/// it has to keep back enough of the buffer for a terminator split across two
+/// reads. A split inside `\final\` is what catches a keep-back that is off by
+/// even one byte: the message is complete but never recognised, so the
+/// connection stalls rather than failing.
+#[tokio::test]
+async fn a_terminator_split_across_two_reads_is_still_found() {
+    let (mut server, mut client) = pair();
+    let message = "\\login\\\\challenge\\synthetic\\final\\";
+    let (head, tail) = message.split_at(message.len() - 3);
+    assert!(
+        head.ends_with("\\fin"),
+        "the split must fall inside the terminator"
+    );
+
+    let mut buffered = Vec::new();
+    let (read, ()) = tokio::join!(read_message(&mut server, &mut buffered), async {
+        client.write_all(head.as_bytes()).await.unwrap();
+        client.flush().await.unwrap();
+        // Long enough that the server's first read returns only the head.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        client.write_all(tail.as_bytes()).await.unwrap();
+        client.flush().await.unwrap();
+    });
+    assert_eq!(read.as_deref(), Some(message));
+}
+
+#[derive(Clone)]
+struct StoredAccount;
+impl Record for StoredAccount {
+    fn partner_challenge(&self) -> &str {
+        "challenge"
+    }
+    fn user_id(&self) -> u32 {
+        1
+    }
+    fn profile_id(&self) -> u32 {
+        7
+    }
+    fn nick(&self) -> &str {
+        "stored"
+    }
+}
+struct StoredTicket;
+impl Ticket for StoredTicket {
+    fn value(&self) -> &str {
+        ""
+    }
+}
+/// A backend whose stored nickname the test chooses.
+struct StoredNick(String);
+impl observe::Observer for StoredNick {}
+impl Backend for StoredNick {
+    type Record = StoredAccount;
+    type Ticket<'a>
+        = StoredTicket
+    where
+        Self: 'a;
+    fn resolve(&self, _token: &str, _game_id: i64) -> Option<Self::Record> {
+        None
+    }
+    fn issue_login_ticket_for_peer(
+        &self,
+        _record: Self::Record,
+        _peer: std::net::IpAddr,
+    ) -> Result<Self::Ticket<'_>, String> {
+        Ok(StoredTicket)
+    }
+    fn account_for_profile(&self, profile_id: u32) -> Option<Profile> {
+        Some(Profile {
+            profile_id,
+            nick: self.0.clone(),
+        })
+    }
+    fn fill_random(&self, bytes: &mut [u8]) -> Result<(), String> {
+        bytes.fill(7);
+        Ok(())
+    }
+}
+
+/// The nickname comes from the application, which may hold one GP cannot
+/// carry. That used to reach an `expect` and panic the connection task; a
+/// logged-in console has to be answered instead, and the unusable value must
+/// not be echoed into the reply or the log.
+#[tokio::test]
+async fn a_stored_nickname_gp_cannot_carry_is_answered_not_panicked() {
+    for nick in ["John Doe", "back\\slash", &"x".repeat(31), ""] {
+        let (mut server, mut client) = pair();
+        let peer = server.peer_addr().unwrap();
+        let tokens = StoredNick(nick.to_owned());
+        client
+            .write_all(b"\\getprofile\\\\profileid\\7\\sesskey\\1\\id\\2\\final\\")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        serve_session(&mut server, &mut Vec::new(), &tokens, 1, peer).await;
+        // Close the write side so the client sees the reply then EOF.
+        server.shutdown().await.unwrap();
+
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(
+            reply.starts_with("\\error\\") && reply.ends_with("\\id\\2\\final\\"),
+            "{nick:?} answered with {reply:?}"
+        );
+        if !nick.is_empty() {
+            assert!(!reply.contains(nick), "{nick:?} leaked into {reply:?}");
+        }
+    }
+}
+
+/// The control: a nickname GP can carry is still answered with profile info.
+#[tokio::test]
+async fn a_usable_stored_nickname_is_answered_with_profile_info() {
+    let (mut server, mut client) = pair();
+    let peer = server.peer_addr().unwrap();
+    let tokens = StoredNick("GoodNick".to_owned());
+    client
+        .write_all(b"\\getprofile\\\\profileid\\7\\sesskey\\1\\id\\2\\final\\")
+        .await
+        .unwrap();
+    client.shutdown().await.unwrap();
+
+    serve_session(&mut server, &mut Vec::new(), &tokens, 1, peer).await;
+    server.shutdown().await.unwrap();
+
+    let mut reply = String::new();
+    client.read_to_string(&mut reply).await.unwrap();
+    assert_eq!(
+        reply,
+        "\\pi\\\\profileid\\7\\nick\\GoodNick\\uniquenick\\GoodNick\\sig\\\\id\\2\\final\\"
+    );
+}
+
+/// A backend whose entropy source fails. `fill_random` returning an error is a
+/// documented outcome, so it must not be turned into a panic: under
+/// `panic = "abort"` that would take the embedding process down.
+struct NoEntropy;
+impl observe::Observer for NoEntropy {}
+impl Backend for NoEntropy {
+    type Record = StoredAccount;
+    type Ticket<'a>
+        = StoredTicket
+    where
+        Self: 'a;
+    fn resolve(&self, _token: &str, _game_id: i64) -> Option<Self::Record> {
+        None
+    }
+    fn issue_login_ticket_for_peer(
+        &self,
+        _record: Self::Record,
+        _peer: std::net::IpAddr,
+    ) -> Result<Self::Ticket<'_>, String> {
+        Ok(StoredTicket)
+    }
+    fn account_for_profile(&self, _profile_id: u32) -> Option<Profile> {
+        None
+    }
+    fn fill_random(&self, _bytes: &mut [u8]) -> Result<(), String> {
+        Err("entropy pool unavailable".to_owned())
+    }
+}
+
+#[tokio::test]
+async fn a_backend_without_entropy_closes_the_connection_instead_of_panicking() {
+    let (server, mut client) = pair();
+    let config = Config {
+        game_name: "title".to_owned(),
+        game_id: 1,
+    };
+    let sessions = AtomicU32::new(1);
+
+    serve_connection(&[(config, Arc::new(NoEntropy))], &sessions, server).await;
+
+    // No challenge is offered, and the connection is closed rather than left
+    // waiting for a login it cannot verify.
+    let mut offered = String::new();
+    client.read_to_string(&mut offered).await.unwrap();
+    assert_eq!(offered, "", "a predictable challenge must never be sent");
+}
+
+/// The control: entropy available means a challenge is offered.
+#[tokio::test]
+async fn a_backend_with_entropy_offers_a_challenge() {
+    let (server, mut client) = pair();
+    let config = Config {
+        game_name: "title".to_owned(),
+        game_id: 1,
+    };
+    let sessions = AtomicU32::new(1);
+    let tokens = StoredNick("unused".to_owned());
+
+    let routes = [(config, Arc::new(tokens))];
+    let serve = serve_connection(&routes, &sessions, server);
+    let read = async {
+        let mut offered = vec![0u8; "\\lc\\1\\challenge\\".len()];
+        client.read_exact(&mut offered).await.unwrap();
+        // Close rather than waiting out the login deadline.
+        client.shutdown().await.unwrap();
+        offered
+    };
+    let (_, offered) = tokio::join!(serve, read);
+    assert_eq!(String::from_utf8(offered).unwrap(), "\\lc\\1\\challenge\\");
+}

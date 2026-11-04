@@ -11,8 +11,9 @@ pub(super) fn login(message: &str) -> String {
 }
 
 pub(super) fn session(message: &str) -> String {
-    let parsed = gp::command_of(message).is_ok();
-    let disposition = match gp::command_of(message) {
+    let command = gp::command_of(message);
+    let parsed = command.is_ok();
+    let disposition = match command {
         Ok("getprofile" | "ka" | "logout") => "handled",
         Ok(_) => "ignored",
         Err(_) => "unparsed",
