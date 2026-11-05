@@ -249,3 +249,224 @@ fn the_detailed_and_optional_named_init_parsers_agree() {
         );
     }
 }
+
+/// The acknowledgement is the init with one byte changed, because what a
+/// client checks in it has not been read: every other byte is one the peer
+/// itself sent, including the version this service does not gate on.
+#[test]
+fn an_init_ack_echoes_the_init_it_answers() {
+    let mut packet = init_packet(0xDEADBEEF, 2, 1);
+    packet.extend_from_slice(b"SyntheticTitle\0");
+    let ack = init_ack(&packet).unwrap();
+    assert_eq!(
+        ack.len(),
+        INIT_WITH_ADDRESS_LEN,
+        "the SDK's INITPACKET_SIZE, which is the length this packet is read at"
+    );
+    assert_eq!(ack[..6], MAGIC, "the magic is unchanged");
+    assert_eq!(ack[6], packet[6], "the peer's own version byte");
+    assert_eq!(ack[7], packet_type::INIT_ACK, "only the type changes");
+    assert_eq!(cookie_of(&ack), Some(0xDEADBEEF));
+    assert_eq!(
+        ack[8..],
+        packet[8..INIT_WITH_ADDRESS_LEN],
+        "cookie and InitPacket body echoed, the title name dropped"
+    );
+
+    // A short init is padded to the size the client reads rather than
+    // answered at its own length.
+    let short = init_ack(&packet[..HEADER_LEN]).unwrap();
+    assert_eq!(short.len(), INIT_WITH_ADDRESS_LEN);
+    assert_eq!(short[HEADER_LEN..], [0; 9], "the absent body is zeroed");
+
+    // An older generation is answered in its own version, not in this one.
+    let mut older = packet.clone();
+    older[6] = 2;
+    assert_eq!(init_ack(&older).unwrap()[6], 2);
+
+    // The port type is what the peer needs back: it acknowledges per port
+    // type and probes several, so an ack that lost it would not end the
+    // retry loop for the right socket.
+    assert_eq!(init_ack(&init_packet(1, 3, 0)).unwrap()[12], 3);
+
+    for len in 0..HEADER_LEN {
+        assert_eq!(init_ack(&packet[..len]), None, "{len} bytes is not an init");
+    }
+    assert!(init_ack(&packet[..HEADER_LEN]).is_some(), "a bodiless init");
+}
+
+/// Every type the protocol defines parses. A listener has to tell a packet it
+/// has no work for from a datagram it does not recognise at all, because only
+/// the second is worth reporting as malformed.
+#[test]
+fn defined_types_parse_and_only_unknown_ones_are_refused() {
+    let typed = |packet_type: u8| {
+        let mut packet = init_packet(0xABCD, 0, 0);
+        packet[7] = packet_type;
+        packet
+    };
+    assert_eq!(
+        parse(&typed(packet_type::CONNECT_ACK)),
+        Ok(Packet::ConnectAck { cookie: 0xABCD })
+    );
+    for defined in [
+        packet_type::CONNECT,
+        packet_type::CONNECT_PING,
+        packet_type::PREINIT_ACK,
+    ] {
+        assert_eq!(
+            parse(&typed(defined)),
+            Ok(Packet::Unacted {
+                packet_type: defined,
+                cookie: 0xABCD,
+            }),
+            "type {defined:#04x} is defined by the protocol"
+        );
+    }
+    for defined in [packet_type::INIT_ACK, packet_type::REPORT_ACK] {
+        assert_eq!(
+            parse(&typed(defined)),
+            Ok(Packet::Unacted {
+                packet_type: defined,
+                cookie: 0xABCD,
+            }),
+            "type {defined:#04x} is this service's own reply reflected back"
+        );
+    }
+    // A report is acted on: it is what releases the peer from ns_reportsent.
+    assert!(matches!(
+        parse(&typed(packet_type::REPORT)),
+        Ok(Packet::Report(report)) if report.cookie == 0xABCD
+    ));
+    for unknown in [2u8, 3, 4, 8, 9, 10, 11, 12, 0x0F, 0x11, 0xFF] {
+        assert_eq!(
+            parse(&typed(unknown)),
+            Err(NatNegError::UnhandledType(unknown)),
+            "type {unknown:#04x}"
+        );
+    }
+}
+
+/// Title routing applies to INIT alone: only an INIT carries a name. A
+/// connect_ack refused here must say that it is the wrong type, not that it
+/// is missing a field its layout never had.
+#[test]
+fn a_named_init_parser_refuses_other_types_by_type() {
+    let mut packet = init_packet(1, 0, 0);
+    packet.extend_from_slice(b"SyntheticTitle\0");
+    packet[7] = packet_type::CONNECT_ACK;
+    assert_eq!(
+        parse_named_init_detailed(&packet),
+        Err(NamedInitRefusal::NotInit(NatNegError::UnhandledType(
+            packet_type::CONNECT_ACK
+        )))
+    );
+}
+
+/// A complete report as the SDK's `SendReportPacket` lays one out: the
+/// twelve-byte header, then `porttype`, `clientindex`, `negResult`, four
+/// bytes of `natType`, four of `natMappingScheme` and a fifty-byte game name.
+fn report_packet(cookie: u32, success: bool, name: Option<&str>) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(REPORT_LEN);
+    packet.extend_from_slice(&MAGIC);
+    packet.push(VERSION);
+    packet.push(packet_type::REPORT);
+    packet.extend_from_slice(&cookie.to_be_bytes());
+    // porttype: the SDK never assigns it, so a real report carries stack
+    // residue here. A non-zero value proves nothing downstream reads it.
+    packet.push(0xA5);
+    packet.push(7); // clientindex
+    packet.push(u8::from(success)); // negResult, a boolean despite the name
+    packet.extend_from_slice(&[1, 0, 0, 0]); // natType
+    packet.extend_from_slice(&[2, 0, 0, 0]); // natMappingScheme
+    let mut field = [0u8; 50];
+    if let Some(name) = name {
+        field[..name.len()].copy_from_slice(name.as_bytes());
+    } else {
+        // Not cleared by the SDK when the game name is empty.
+        field.fill(0x7F);
+    }
+    packet.extend_from_slice(&field);
+    assert_eq!(packet.len(), REPORT_LEN, "REPORTPACKET_SIZE is 12 + 61");
+    packet
+}
+
+#[test]
+fn a_report_yields_the_fields_the_sdk_actually_assigns() {
+    let Ok(Packet::Report(report)) =
+        parse(&report_packet(0x6E8A73CD, true, Some("SyntheticTitle")))
+    else {
+        panic!("a report is acted on, not refused");
+    };
+    assert_eq!(report.cookie, 0x6E8A73CD);
+    assert_eq!(report.client_index, 7);
+    assert!(report.success);
+    assert_eq!(report.game_name.as_deref(), Some("SyntheticTitle"));
+    assert_eq!(report.nat_bytes, Some([1, 0, 0, 0, 2, 0, 0, 0]));
+
+    let Ok(Packet::Report(failed)) = parse(&report_packet(1, false, Some("SyntheticTitle"))) else {
+        panic!("a failure report is still a report");
+    };
+    assert!(
+        !failed.success,
+        "negResult is a boolean, not a NegotiateResult"
+    );
+}
+
+/// `SendReportPacket` copies the game name in only when it is non-empty and
+/// never clears the field, so an unnamed report carries fifty bytes of
+/// whatever was on the console's stack. That must not become a title name.
+#[test]
+fn an_unnamed_report_does_not_invent_a_game_name() {
+    let Ok(Packet::Report(report)) = parse(&report_packet(1, true, None)) else {
+        panic!("still a report");
+    };
+    assert_eq!(report.game_name, None);
+}
+
+/// A peer repeats its report until it is acknowledged, so a short or
+/// unfamiliar one must still parse far enough to be answered.
+#[test]
+fn a_short_report_still_parses_so_it_can_still_be_acknowledged() {
+    let full = report_packet(0xABCD, true, Some("SyntheticTitle"));
+    for length in HEADER_LEN..full.len() {
+        let Ok(Packet::Report(report)) = parse(&full[..length]) else {
+            panic!("length {length} must still be a report");
+        };
+        assert_eq!(report.cookie, 0xABCD, "length {length}");
+        assert!(report_ack(&full[..length]).is_some(), "length {length}");
+    }
+    for length in 0..HEADER_LEN {
+        assert_eq!(parse(&full[..length]), Err(NatNegError::TooShort));
+        assert_eq!(report_ack(&full[..length]), None);
+    }
+}
+
+#[test]
+fn a_report_ack_echoes_the_report_with_only_the_type_changed() {
+    let report = report_packet(0x6E8A73CD, true, Some("SyntheticTitle"));
+    let ack = report_ack(&report).unwrap();
+
+    assert_eq!(
+        ack.len(),
+        REPORT_LEN,
+        "sent at the length a report is sent at"
+    );
+    assert_eq!(&ack[..MAGIC.len()], &MAGIC);
+    assert_eq!(ack[6], report[6], "the peer's own version byte");
+    assert_eq!(ack[7], packet_type::REPORT_ACK, "the one byte that changes");
+    assert_eq!(
+        &ack[8..],
+        &report[8..],
+        "cookie and body echoed, so the ack cannot disagree with the report"
+    );
+
+    // A short report is padded to the full length rather than answered short.
+    let padded = report_ack(&report[..HEADER_LEN + 3]).unwrap();
+    assert_eq!(padded.len(), REPORT_LEN);
+    assert_eq!(
+        &padded[HEADER_LEN..HEADER_LEN + 3],
+        &report[HEADER_LEN..HEADER_LEN + 3]
+    );
+    assert!(padded[HEADER_LEN + 3..].iter().all(|byte| *byte == 0));
+}

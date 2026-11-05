@@ -95,6 +95,23 @@ where
     if routes.is_empty() {
         return Err("GP needs at least one title".into());
     }
+    crate::distinct_titles(
+        "gp",
+        routes.iter().map(|(config, _)| config.game_name.as_str()),
+    )?;
+    // GP selects a route by which backend resolves the login token rather
+    // than by name, so a duplicate `game_id` is the ambiguity that matters
+    // here: two routes could both resolve one title's tokens, and the first
+    // to accept would win silently.
+    let mut ids: Vec<i64> = routes.iter().map(|(config, _)| config.game_id).collect();
+    ids.sort_unstable();
+    if let Some(duplicate) = ids.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(format!(
+            "gp has more than one route for game id {}; a token resolving on either would be \
+             answered by whichever route is tried first",
+            duplicate[0]
+        ));
+    }
     routes[0].1.event(
         "gp",
         &format!(

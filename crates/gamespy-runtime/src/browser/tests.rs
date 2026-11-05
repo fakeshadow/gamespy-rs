@@ -124,6 +124,47 @@ fn holding(source: SocketAddr, indexed: bool) -> Arc<Registry> {
 const INSTANCE_KEY: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
 const CLIENT: SocketAddr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 50000);
 
+#[test]
+fn no_server_list_sends_only_the_fixed_header_and_preserves_the_cipher() {
+    let backend = holding("127.0.0.1:7777".parse().unwrap(), false);
+    let registry: SharedRegistry = backend.clone();
+    let request = ListRequest {
+        request_type: 0,
+        protocol_version: 1,
+        encoding_version: 3,
+        game_version: 0,
+        from_game: "samplegamex",
+        for_game: "samplegamex",
+        challenge: *b"abcdefgh",
+        filter: "",
+        fields: "\\hostname",
+        options: browser::options::NO_SERVER_LIST,
+        source_ip: None,
+        max_servers: None,
+        trailing: &[],
+    };
+    let (reply, mut encoder, declared, listed) =
+        build_list_reply(&request, "ABC123", CLIENT.ip(), &registry).unwrap();
+    assert_eq!(listed, 0);
+    assert!(declared.is_empty());
+    assert_eq!(backend.listings.load(Ordering::Relaxed), 0);
+
+    let len1 = (reply[0] ^ browser_crypt::LEN1_XOR).wrapping_add(2) as usize;
+    let len2 = (reply[len1 - 1] ^ browser_crypt::LEN2_XOR) as usize;
+    let key =
+        browser_crypt::derive_key(request.challenge, b"ABC123", &reply[len1..len1 + len2]).unwrap();
+    let mut decoder = browser_crypt::Cipher::new(&key).unwrap();
+    let mut payload = reply[len1 + len2..].to_vec();
+    decoder.apply_decrypt(&mut payload);
+    // The SDK leaves its fixed-header parser after these six bytes.
+    assert_eq!(payload, [127, 0, 0, 1, 0x19, 0x64]);
+    let push = [0, 8, 4, 1, 2, 3, 4, 5];
+    let mut encrypted = push;
+    encoder.apply(&mut encrypted);
+    decoder.apply_decrypt(&mut encrypted);
+    assert_eq!(encrypted, push);
+}
+
 /// The relay has to leave from the QR2 socket. A host's NAT mapping was made
 /// by its own heartbeats to that address, so a relay from any other source
 /// port is dropped by a NAT that restricts by port — and that is the only case
@@ -160,10 +201,20 @@ async fn a_relay_leaves_from_the_qr2_socket_the_host_heartbeats_to() {
         from, qr2_address,
         "the host must see the relay coming from the QR2 socket"
     );
+    // The id is generated per relay, so the packet is checked field by field
+    // rather than against a fixed one.
+    let relayed = &buffer[..read];
     assert_eq!(
-        &buffer[..read],
-        gamespy_proto::qr2::client_message(INSTANCE_KEY, b"cookie").as_slice(),
-        "the payload is carried through untouched"
+        &relayed[..3],
+        &[0xFE, 0xFD, 0x06],
+        "fe fd then a client message"
+    );
+    assert_eq!(&relayed[3..7], &INSTANCE_KEY, "or the host drops it");
+    assert_eq!(
+        &relayed[11..],
+        b"cookie",
+        "the payload is carried through untouched, after the four-byte message id \
+         the host strips before its game sees it"
     );
 }
 
@@ -430,6 +481,10 @@ fn a_list_reply_records_each_entry_and_its_composed_payload() {
         filter: "",
         fields: "\\hostname",
         options: 0x80,
+        // LIMIT_RESULT_COUNT, so the count the client appends is present too:
+        // the bit and the field cannot occur apart on the wire.
+        source_ip: None,
+        max_servers: Some(8),
         trailing: &[],
     };
 
@@ -466,4 +521,79 @@ fn a_list_reply_records_each_entry_and_its_composed_payload() {
         "the plaintext payload is dumped for byte-for-byte comparison"
     );
     assert!(registry.said("payload trace:"));
+}
+
+/// A query for a title this listener does not serve is the likeliest
+/// misconfiguration there is, and it used to be the one outcome with no
+/// diagnostic: the request was dropped by a bare `return`, while the
+/// impossible version of the same condition had the only log line.
+#[tokio::test]
+async fn a_query_for_an_unserved_title_says_so() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let registry = holding("127.0.0.1:7777".parse().unwrap(), false);
+    let shared: SharedRegistry = registry.clone();
+    let config = Config {
+        game_name: "samplegamex".into(),
+        secret_key: Some("secret".into()),
+    };
+    let _served = spawn_multi_with_listener(vec![(config, shared)], listener, None).unwrap();
+
+    // A syntactically valid list request for another game.
+    let mut body = vec![0u8, 1, 3];
+    body.extend_from_slice(&0u32.to_be_bytes());
+    body.extend_from_slice(b"othergame\0othergame\0");
+    body.extend_from_slice(b"abcdefgh");
+    body.extend_from_slice(b"\0\\hostname\0");
+    body.extend_from_slice(&0u32.to_be_bytes());
+    let mut request = ((body.len() + 2) as u16).to_be_bytes().to_vec();
+    request.extend_from_slice(&body);
+
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    std::io::Write::write_all(&mut stream, &request).unwrap();
+    let _ = std::io::Write::flush(&mut stream);
+
+    // The connection is closed without a reply, which is correct; what must
+    // not happen is that it closes without saying why.
+    for _ in 0..200 {
+        if registry
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("does not serve") && line.contains("othergame"))
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "an unserved title must be recorded, got {:?}",
+        registry.events.lock().unwrap()
+    );
+}
+
+/// Two routes for one title make every query for it ambiguous and dropped, so
+/// the listener refuses to start rather than serving a title that cannot work.
+#[test]
+fn duplicate_titles_are_refused_when_the_listener_starts() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let registry: SharedRegistry = holding("127.0.0.1:7777".parse().unwrap(), false);
+    let route = |name: &str| {
+        (
+            Config {
+                game_name: name.into(),
+                secret_key: Some("secret".into()),
+            },
+            registry.clone(),
+        )
+    };
+    let error = spawn_multi_with_listener(
+        vec![route("samplegamex"), route("SampleGameX")],
+        listener,
+        None,
+    )
+    .map(|_| ())
+    .expect_err("two routes for one title cannot be served");
+    assert!(error.contains("more than one route"), "{error}");
 }

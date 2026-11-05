@@ -225,7 +225,58 @@ fn error_message_cannot_break_framing() {
     let message = error_message(256, "bad \\thing\r\nhere");
     assert_eq!(
         message,
-        "\\error\\\\err\\256\\errmsg\\bad  thing  here\\final\\"
+        "\\error\\\\err\\256\\fatal\\\\errmsg\\bad  thing  here\\final\\"
+    );
+}
+
+/// `gpiCheckForError` reports `GP_FATAL` only when it finds `\fatal\`, and
+/// `GP_NON_FATAL` otherwise — while the connection ends either way. An error
+/// that really does end the connection has to say so, and one that does not
+/// has to leave the key out.
+#[test]
+fn a_connection_ending_error_says_fatal_and_a_survivable_one_does_not() {
+    assert!(
+        error_message(256, "login refused").contains("\\fatal\\"),
+        "the default is a connection-ending error"
+    );
+    let survivable = error_message_non_fatal(256, "no such profile");
+    assert!(!survivable.contains("\\fatal\\"));
+    assert!(survivable.starts_with("\\error\\\\err\\256\\errmsg\\"));
+
+    // A per-operation failure answers one request; it must not be reported
+    // as the end of the presence connection.
+    let scoped = profile_info_error(7, "no such profile");
+    assert!(!scoped.contains("\\fatal\\"), "{scoped}");
+    assert!(scoped.ends_with("\\id\\7\\final\\"), "{scoped}");
+}
+
+/// `GP_UNIQUENICK_LEN` is 21 and `GP_NICK_LEN` is 31, so a uniquenick the
+/// client can hold is twenty bytes, not thirty. A longer one is truncated
+/// inside the client where this service cannot observe it.
+#[test]
+fn a_uniquenick_is_bounded_by_its_own_field_not_by_the_nick_field() {
+    assert_eq!(MAX_UNIQUE_NICK_BYTES, 20);
+    assert_eq!(MAX_NICK_BYTES, 30);
+
+    let success = |nick: &str| {
+        login_response(&LoginSuccess {
+            sess_key: 1,
+            user_id: 2,
+            profile_id: 3,
+            unique_nick: nick,
+            login_ticket: "",
+            proof: &"a".repeat(32),
+        })
+    };
+    assert!(success(&"n".repeat(20)).is_ok());
+    assert_eq!(
+        success(&"n".repeat(21)),
+        Err(GpError::FieldTooLong("uniquenick"))
+    );
+    assert_eq!(
+        profile_info_response(1, 1, &"n".repeat(21)),
+        Err(GpError::InvalidField("nick")),
+        "the same value is sent as uniquenick too, so it takes the smaller bound"
     );
 }
 

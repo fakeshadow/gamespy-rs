@@ -12,7 +12,7 @@ readme = "README.md"
 
 [workspace.dependencies]
 md5 = "=0.8.0"
-gamespy-proto = { path = "crates/gamespy-proto", version = "0.1.1" }
+gamespy-proto = { path = "crates/gamespy-proto", version = "0.1.2" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

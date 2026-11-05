@@ -21,10 +21,50 @@ pub struct ListRequest<'a> {
     /// Backslash-delimited list of keys the client wants back.
     pub fields: &'a str,
     pub options: u32,
-    /// Bytes after `options` that this parser does not interpret. Carried so a
-    /// caller can log them; the client's own encoder has to be read before
-    /// these are given names.
+    /// The client's own source address, when [`options::ALTERNATE_SOURCE_IP`]
+    /// says one follows. Big-endian, as the client writes it.
+    ///
+    /// A client behind a proxy uses this to say which address a reply's
+    /// header should name back at it, instead of the one this connection
+    /// arrived from.
+    pub source_ip: Option<[u8; 4]>,
+    /// The most servers the client wants back, when
+    /// [`options::LIMIT_RESULT_COUNT`] says a count follows.
+    ///
+    /// **Little-endian**, alone among this request's integers: the client
+    /// appends it with the SDK's `BufferAddIntLE` while every other number
+    /// here is big-endian.
+    pub max_servers: Option<u32>,
+    /// Bytes after the option-dependent fields above, which nothing in the
+    /// referenced SDK writes. Carried so a caller can log them.
     pub trailing: &'a [u8],
+}
+
+/// Bits of [`ListRequest::options`].
+///
+/// Values from the referenced SDK's `sb_internal.h`. Two of them add fields
+/// to the request itself, which is why they have to be read to parse it at
+/// all; the rest change what a reply should contain.
+pub mod options {
+    /// Send the requested fields for every server, not only for the ones a
+    /// client has no cached entry for.
+    pub const SEND_FIELDS_FOR_ALL: u32 = 1;
+    /// **Send no server list.** The client opened this connection to issue a
+    /// follow-up — a server-info request, or the send-message that starts a
+    /// NAT negotiation — and is not waiting for a list. A reply that carries
+    /// one anyway gives its parser a list where it expects the header and
+    /// then push messages.
+    pub const NO_SERVER_LIST: u32 = 2;
+    /// Keep the connection open and push updates as sessions change.
+    pub const PUSH_UPDATES: u32 = 4;
+    /// A four-byte source address follows `options`; see
+    /// [`ListRequest::source_ip`].
+    pub const ALTERNATE_SOURCE_IP: u32 = 8;
+    pub const SEND_GROUPS: u32 = 32;
+    pub const NO_LIST_CACHE: u32 = 64;
+    /// A four-byte little-endian maximum follows; see
+    /// [`ListRequest::max_servers`].
+    pub const LIMIT_RESULT_COUNT: u32 = 128;
 }
 
 pub const CHALLENGE_LEN: usize = 8;
@@ -78,6 +118,15 @@ impl<'a> ListRequest<'a> {
         let filter = reader.cstr()?;
         let fields = reader.cstr()?;
         let options = reader.be_u32()?;
+        // Both are conditional on an option bit and must be read in this
+        // order: the client appends the source address first and the result
+        // limit second.
+        let source_ip = (options & options::ALTERNATE_SOURCE_IP != 0)
+            .then(|| reader.array::<4>())
+            .transpose()?;
+        let max_servers = (options & options::LIMIT_RESULT_COUNT != 0)
+            .then(|| reader.le_u32())
+            .transpose()?;
         let trailing = reader.rest();
 
         Ok(Self {
@@ -91,8 +140,20 @@ impl<'a> ListRequest<'a> {
             filter,
             fields,
             options,
+            source_ip,
+            max_servers,
             trailing,
         })
+    }
+
+    /// Whether `bit` is set in [`ListRequest::options`]; see [`options`].
+    pub fn has_option(&self, bit: u32) -> bool {
+        self.options & bit != 0
+    }
+
+    /// Whether the client asked for no server list at all.
+    pub fn wants_no_list(&self) -> bool {
+        self.has_option(options::NO_SERVER_LIST)
     }
 
     /// The keys the client asked for, in order, with empty entries dropped.
@@ -127,6 +188,12 @@ impl<'a> Reader<'a> {
             .ok_or(ParseError::TooShort)?;
         self.position += 4;
         Ok(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
+    }
+
+    /// The one little-endian integer in this request; see
+    /// [`ListRequest::max_servers`].
+    fn le_u32(&mut self) -> Result<u32, ParseError> {
+        self.array::<4>().map(u32::from_le_bytes)
     }
 
     fn array<const N: usize>(&mut self) -> Result<[u8; N], ParseError> {

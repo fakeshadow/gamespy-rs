@@ -79,10 +79,84 @@ fn parses_the_console_capture() {
     assert_eq!(request.from_game, "samplegamex");
     assert_eq!(request.for_game, "samplegamex");
     assert_eq!(&request.challenge, b"hk2H)rL(");
-    assert_eq!(request.options, 0x0000_0080);
-    // Two of the four trailing bytes are not named yet; they are carried
-    // verbatim so a listener can log them.
-    assert_eq!(request.trailing, &[0x32, 0x00, 0x00, 0x00]);
+    // LIMIT_RESULT_COUNT, and the four bytes that used to be unnamed
+    // trailing data are the count it announces: 0x32 little-endian, so this
+    // console has room for fifty servers and asked for no more. A reply that
+    // carried more than fifty was ignoring the request.
+    assert_eq!(request.options, browser_options::LIMIT_RESULT_COUNT);
+    assert!(!request.wants_no_list());
+    assert_eq!(request.max_servers, Some(50));
+    assert_eq!(
+        request.source_ip, None,
+        "this console names no alternate source"
+    );
+    assert_eq!(
+        request.trailing,
+        &[] as &[u8],
+        "with both option-dependent fields read, nothing is left over"
+    );
+}
+
+use super::options as browser_options;
+
+/// The two option-dependent fields are read in the order the client appends
+/// them, and only when their bit is set. Reading them the other way round, or
+/// unconditionally, mis-parses every request that sets one and not the other.
+#[test]
+fn the_option_dependent_fields_are_read_in_the_clients_own_order() {
+    let build = |options: u32, tail: &[u8]| {
+        let mut body = vec![0u8, 1, 3];
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(b"samplegamex\0samplegamex\0");
+        body.extend_from_slice(b"hk2H)rL(");
+        body.extend_from_slice(b"\0");
+        body.extend_from_slice(b"\\hostname\0");
+        body.extend_from_slice(&options.to_be_bytes());
+        body.extend_from_slice(tail);
+        let mut packet = ((body.len() + 2) as u16).to_be_bytes().to_vec();
+        packet.extend_from_slice(&body);
+        packet
+    };
+
+    // Source address alone.
+    let packet = build(browser_options::ALTERNATE_SOURCE_IP, &[203, 0, 113, 7]);
+    let request = ListRequest::parse(&packet).unwrap();
+    assert_eq!(request.source_ip, Some([203, 0, 113, 7]));
+    assert_eq!(request.max_servers, None);
+    assert!(request.trailing.is_empty());
+
+    // Result limit alone, little-endian.
+    let packet = build(browser_options::LIMIT_RESULT_COUNT, &[0x0A, 0, 0, 0]);
+    let request = ListRequest::parse(&packet).unwrap();
+    assert_eq!(request.source_ip, None);
+    assert_eq!(
+        request.max_servers,
+        Some(10),
+        "this one integer is little-endian; big-endian would read 167772160"
+    );
+
+    // Both: address first, then limit.
+    let packet = build(
+        browser_options::ALTERNATE_SOURCE_IP | browser_options::LIMIT_RESULT_COUNT,
+        &[203, 0, 113, 7, 0x0A, 0, 0, 0],
+    );
+    let request = ListRequest::parse(&packet).unwrap();
+    assert_eq!(request.source_ip, Some([203, 0, 113, 7]));
+    assert_eq!(request.max_servers, Some(10));
+    assert!(request.trailing.is_empty());
+
+    // A bit set with its field missing is a truncated request, not one with
+    // a defaulted field.
+    assert_eq!(
+        ListRequest::parse(&build(browser_options::ALTERNATE_SOURCE_IP, &[203, 0])),
+        Err(ParseError::TooShort)
+    );
+
+    // NO_SERVER_LIST adds no field of its own.
+    let packet = build(browser_options::NO_SERVER_LIST, &[]);
+    let request = ListRequest::parse(&packet).unwrap();
+    assert!(request.wants_no_list());
+    assert_eq!(request.max_servers, None);
 }
 
 #[test]

@@ -9,7 +9,18 @@ pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 pub const MAX_AUTH_TOKEN_BYTES: usize = 255;
 pub const MAX_SERVER_CHALLENGE_BYTES: usize = 127;
 pub const MAX_USER_CHALLENGE_BYTES: usize = 255;
-pub const MAX_UNIQUE_NICK_BYTES: usize = 30;
+/// Longest `\nick\` the client can hold: `GP_NICK_LEN` 31, less its
+/// terminator.
+pub const MAX_NICK_BYTES: usize = 30;
+
+/// Longest `\uniquenick\` the client can hold.
+///
+/// **Twenty, not thirty.** `GP_UNIQUENICK_LEN` is 21 in the referenced SDK's
+/// `gp.h`, against `GP_NICK_LEN` 31 for a display nickname — two different
+/// bounds, and this is the smaller one. A longer value is truncated inside
+/// the client, where this service cannot see it happen, so it is refused
+/// here instead.
+pub const MAX_UNIQUE_NICK_BYTES: usize = 20;
 
 /// Longest `\lt\` login ticket the client can hold.
 ///
@@ -152,7 +163,10 @@ pub fn profile_info_response(
     if profile_id == 0 || operation_id == 0 {
         return Err(GpError::InvalidField("id"));
     }
-    if nick.len() > MAX_UNIQUE_NICK_BYTES || !is_safe_value(nick) {
+    // A display nickname, so GP_NICK_LEN bounds it — but it is also sent as
+    // `\uniquenick\` below, which has the shorter bound, so the value has to
+    // satisfy both.
+    if nick.len() > MAX_NICK_BYTES.min(MAX_UNIQUE_NICK_BYTES) || !is_safe_value(nick) {
         return Err(GpError::InvalidField("nick"));
     }
     Ok(format!(
@@ -160,8 +174,14 @@ pub fn profile_info_response(
     ))
 }
 
+/// A failed profile lookup, scoped to the operation that asked.
+///
+/// Not fatal: this answers one `getprofile`, and a name this service cannot
+/// resolve must not take the presence connection down with it. The `\id\` is
+/// what routes it to that operation rather than to the connection's global
+/// error callback.
 pub fn profile_info_error(operation_id: u32, message: &str) -> String {
-    let error = error_message(256, message);
+    let error = error_message_non_fatal(256, message);
     format!(
         "{}\\id\\{operation_id}\\final\\",
         error.strip_suffix("\\final\\").unwrap()
@@ -254,8 +274,29 @@ pub fn login_response(success: &LoginSuccess<'_>) -> Result<String, GpError> {
     ))
 }
 
-/// Error message shape read by `gpiCheckForError`: `\error\\err\...\errmsg\...`.
+/// Error message shape read by `gpiCheckForError`:
+/// `\error\\err\...\fatal\\errmsg\...`.
+///
+/// **Carries `\fatal\`.** `gpiCheckForError` searches the whole message for
+/// that key and passes `GP_FATAL` to the application's error callback when it
+/// is there and `GP_NON_FATAL` when it is not — while the caller returns
+/// `GP_SERVER_ERROR` either way and the connection ends. Without the key an
+/// application is told a connection-ending error was survivable, which is the
+/// one thing the field exists to distinguish.
+///
+/// Use [`error_message_non_fatal`] for an error the connection really does
+/// survive.
 pub fn error_message(code: u16, message: &str) -> String {
+    error_with(code, true, message)
+}
+
+/// [`error_message`] without `\fatal\`, for an error that leaves the
+/// connection usable.
+pub fn error_message_non_fatal(code: u16, message: &str) -> String {
+    error_with(code, false, message)
+}
+
+fn error_with(code: u16, fatal: bool, message: &str) -> String {
     let message: String = message
         .chars()
         .map(|character| match character {
@@ -264,7 +305,8 @@ pub fn error_message(code: u16, message: &str) -> String {
         })
         .take(128)
         .collect();
-    format!("\\error\\\\err\\{code}\\errmsg\\{message}\\final\\")
+    let fatal = if fatal { "\\fatal\\" } else { "" };
+    format!("\\error\\\\err\\{code}{fatal}\\errmsg\\{message}\\final\\")
 }
 
 /// Keep-alive the client answers on its presence connection.

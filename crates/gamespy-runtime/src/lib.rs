@@ -27,7 +27,7 @@
 //! | Service | SDK hostname pattern | Transport / conventional port | Runtime entry point |
 //! | --- | --- | --- | --- |
 //! | Availability | `{game}.available.gamespy.com` | UDP 27900 | [`availability::spawn_with_socket`] |
-//! | QR2 registration | `{game}.master.gamespy.com` | UDP 27900 | [`availability::spawn_with_socket`] / [`qr2::handle`] |
+//! | QR2 registration | `{game}.master.gamespy.com` | UDP 27900 | [`availability::spawn_with_socket`] / [`qr2::handle`], or [`availability::spawn_verified_with_socket`] / [`qr2::handle_with_challenges`] to list a host only after it answers a challenge |
 //! | Browser list | `{game}.ms{shard}.gamespy.com` | TCP 28910 | [`browser::spawn_with_listener`] |
 //! | GP presence | `gpcm.gamespy.com` | TCP 29900 | [`gp::spawn_with_listener`] |
 //! | NAT negotiation | `{game}.natneg1.gamespy.com`, `{game}.natneg2.gamespy.com`, `{game}.natneg3.gamespy.com` | UDP 27901 | [`natneg::spawn_with_sockets`], or [`natneg::spawn_with_socket`] for one port |
@@ -69,6 +69,8 @@
 //! | [`http`] readers and SOAP serving | Generic framing on supplied streams; no default hostname, listener or TLS implementation. |
 //! | [`tcp::Connection`], [`tcp::ShutdownConfig`], TCP spawn functions | Generic transport; no service hostname or default port. |
 //! | [`listener::Listener`], [`listener::StopSignal`] | Lifecycle controls for existing listeners, not additional endpoints. |
+//! | [`qr2::Challenges`], [`qr2::handle_with_challenges`] | Pending QR2 registrations on the registration endpoint above. Entries are not sessions: nothing pending is listable or reaches [`discovery::Backend::heartbeat`]. No socket or DNS ownership. |
+//! | [`discovery::DiscoveryTitle`], [`discovery::DiscoveryRoute`] | One title's protocol identity and secret, validated at startup, from which browser and QR2 configuration are derived. A title name is a protocol field, not a hostname. |
 //! | [`discovery`], [`registry`] | Registration/discovery state and policy; stored host addresses identify game hosts, not DNS service names. |
 //! | [`session`] | Account/token/ticket state; no network endpoint. |
 //! | [`observe`] | Diagnostics and byte-formatting helpers; service labels are not DNS names. |
@@ -112,3 +114,44 @@ pub mod sake;
 pub mod sake_file;
 pub mod session;
 pub mod tcp;
+
+/// Refuse a route list that names one title more than once, or names one with
+/// an empty string.
+///
+/// Every multi-title listener here selects a route by matching a name the
+/// client sent, case-insensitively, and **refuses a selector that matches more
+/// than one route** rather than guessing which title was meant. So a duplicate
+/// name does not pick the first route: it makes every request for that title
+/// ambiguous and drops it, which is a total and otherwise silent outage for
+/// that one title while every other title keeps working.
+///
+/// Startup is the only place that can be caught. At request time an ambiguous
+/// name is indistinguishable from a client asking for a title this deployment
+/// does not serve, and both are refusals with nothing to act on.
+///
+/// Comparison is `eq_ignore_ascii_case`, the same comparison the selectors
+/// use, so `"Alpha"` and `"alpha"` are one title and are reported as one.
+pub(crate) fn distinct_titles<'a>(
+    service: &str,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    let mut seen: Vec<String> = Vec::new();
+    for name in names {
+        if name.is_empty() {
+            return Err(format!("{service} has a route with an empty title name"));
+        }
+        let folded = name.to_ascii_lowercase();
+        if seen.contains(&folded) {
+            return Err(format!(
+                "{service} has more than one route for title {name:?}; a selector matching \
+                 several routes is refused rather than guessed, so every request for that \
+                 title would be dropped"
+            ));
+        }
+        seen.push(folded);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod lib_tests;

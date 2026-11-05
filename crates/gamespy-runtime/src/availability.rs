@@ -11,8 +11,23 @@ use std::time::{Duration, Instant};
 
 use gamespy_proto::availability;
 
-use crate::discovery::SharedRegistry;
+use crate::discovery::{DiscoveryRoute, DiscoveryTitle, SharedRegistry};
 use crate::qr2 as qr2_handler;
+use std::sync::Arc;
+
+/// One title served on this endpoint, and whether its registrations are
+/// verified.
+///
+/// `verified` carries the credential, so a route either has one and admits
+/// after a challenge response or has none and admits on the heartbeat's own
+/// claim. There is no third state in which a route promises verification and
+/// silently has no secret to verify with:
+/// [`DiscoveryTitle`] is validated before a listener opens.
+struct Route {
+    title: String,
+    registry: SharedRegistry,
+    verified: Option<Arc<DiscoveryTitle>>,
+}
 
 /// Datagram buffer.
 ///
@@ -47,37 +62,164 @@ const SWEEP_INTERVAL: Duration = Duration::from_millis(100);
 /// Callbacks must return promptly. To own timing and admission policy instead,
 /// receive datagrams in the application and call [`answer`] or [`crate::qr2::handle`],
 /// scheduling [`crate::discovery::Backend::sweep`] there as well.
+/// **Registers on the heartbeat's own claim**, and does not check the
+/// gamename: this listener has one route, so routing returns it
+/// unconditionally and a heartbeat naming any title at all is registered for
+/// the configured one. [`spawn_verified_with_socket`] checks both.
 pub fn spawn_with_socket(
     game_name: String,
     registry: SharedRegistry,
     socket: UdpSocket,
 ) -> Result<Listener, String> {
-    spawn_routes(vec![(game_name, registry)], socket, false)
+    spawn_routes(
+        vec![Route {
+            title: game_name,
+            registry,
+            verified: None,
+        }],
+        socket,
+        false,
+    )
 }
 
 /// Shared availability/QR2 endpoint. Heartbeats select a registry by gamename;
 /// subsequent packets require an unambiguous live source socket/instance binding.
+///
+/// Registers on the heartbeat's own claim, like [`spawn_with_socket`];
+/// gamename routing selects *which* registry a claim goes to and is not an
+/// admission check. [`spawn_multi_verified_with_socket`] admits only after a
+/// challenge response.
 pub fn spawn_multi_with_socket(
     routes: Vec<(String, SharedRegistry)>,
     socket: UdpSocket,
 ) -> Result<Listener, String> {
-    spawn_routes(routes, socket, true)
+    crate::distinct_titles("qr2", routes.iter().map(|(name, _)| name.as_str()))?;
+    spawn_routes(
+        routes
+            .into_iter()
+            .map(|(title, registry)| Route {
+                title,
+                registry,
+                verified: None,
+            })
+            .collect(),
+        socket,
+        true,
+    )
 }
 
-fn spawn_routes(
-    routes: Vec<(String, SharedRegistry)>,
+/// Serve one title, listing a host only after it answers a challenge.
+///
+/// The verified counterpart of [`spawn_with_socket`]. A heartbeat is retained
+/// and **not** listed until the host answers a challenge carrying a fresh
+/// nonce with the title's secret key; see [`crate::qr2::handle_with_challenges`]
+/// for the admission rules, the lifecycle and — importantly — what a success
+/// does and does not prove.
+///
+/// Two behaviours differ from [`spawn_with_socket`], both deliberately:
+///
+/// - a heartbeat's `gamename` is checked against the configured title, where
+///   the unverified single-title listener never looked at it;
+/// - a new host is absent from [`crate::discovery::Backend::listable`] and
+///   from the application's heartbeat hook until verification succeeds.
+///
+/// The credential is validated by [`DiscoveryTitle`] before this returns, so
+/// a listener that promises verification cannot start without one.
+pub fn spawn_verified_with_socket(
+    route: DiscoveryRoute,
     socket: UdpSocket,
-    strict: bool,
 ) -> Result<Listener, String> {
+    spawn_multi_verified_with_socket(vec![route], socket)
+}
+
+/// Serve several verified titles on one availability/QR2 endpoint.
+///
+/// Heartbeats select a route by gamename and each route verifies with its own
+/// secret. A challenge response is resolved through the pending binding its
+/// heartbeat opened, so a **first** registration works even though it has no
+/// listable session yet; a response can only ever admit the generation opened
+/// for the same source socket, instance key and title.
+pub fn spawn_multi_verified_with_socket(
+    routes: Vec<DiscoveryRoute>,
+    socket: UdpSocket,
+) -> Result<Listener, String> {
+    crate::distinct_titles("qr2", routes.iter().map(|route| route.title.game_name()))?;
+    spawn_routes(
+        routes
+            .into_iter()
+            .map(|route| Route {
+                title: route.title.game_name().to_owned(),
+                registry: route.backend,
+                verified: Some(route.title),
+            })
+            .collect(),
+        socket,
+        true,
+    )
+}
+
+fn spawn_routes(routes: Vec<Route>, socket: UdpSocket, strict: bool) -> Result<Listener, String> {
     let registry = &routes
         .first()
         .ok_or("availability needs at least one title")?
-        .1;
+        .registry;
     registry.event(
         "availability",
         &format!(
             "listening on {} (UDP; availability probes answered, other traffic recorded)",
             socket.local_addr().map_err(|error| error.to_string())?
+        ),
+    );
+    // So a capture says what this build actually enforces rather than what a
+    // reader assumes from seeing a challenge on the wire. The policy is per
+    // route, so a mixed list is reported as mixed rather than as whichever
+    // route happens to be first.
+    let verified = routes
+        .iter()
+        .filter(|route| route.verified.is_some())
+        .count();
+    registry.event(
+        "qr2",
+        &format!(
+            "capability trace: answers every heartbeat with a challenge (type {:#04x}) \
+             carrying the host's public address, which is what keeps it announcing. \
+             {} of {} route(s) verify the response before listing a session{}. \
+             Routes {} title(s) by the heartbeat's gamename{}.{}",
+            gamespy_proto::qr2::packet_type::CHALLENGE,
+            verified,
+            routes.len(),
+            if verified == routes.len() {
+                String::new()
+            } else {
+                format!(
+                    "; on the other {}, the response is recorded and NOT checked, so a \
+                     session is listed on the strength of its own heartbeat and traffic \
+                     admission is the deployment's",
+                    routes.len() - verified
+                )
+            },
+            routes.len(),
+            if strict {
+                ""
+            } else {
+                ", except a single unverified route, which is selected without checking it"
+            },
+            // Only where it applies. Printed unconditionally, this described
+            // the guarantees of verified admission on a deployment that
+            // verifies nothing — the exact confusion this trace exists to
+            // prevent, and a reader of such a log has every reason to believe
+            // the sentence is about the server they are running.
+            if verified == 0 {
+                String::new()
+            } else {
+                format!(
+                    " On the {verified} verified route(s): the challenge carries a fresh \
+                     nonce the client's response covers, so a response cannot be replayed \
+                     from an earlier exchange, and a match proves the sender holds that \
+                     title's secret — which ships in every copy of the game, so it is not \
+                     host authentication and authenticates no advertised field."
+                )
+            },
         ),
     );
     socket.set_nonblocking(true).map_err(|e| e.to_string())?;
@@ -116,18 +258,39 @@ fn spawn_routes(
 async fn serve(
     socket: &tokio::net::UdpSocket,
     qr2_socket: &UdpSocket,
-    routes: &[(String, SharedRegistry)],
+    routes: &[Route],
     strict: bool,
 ) {
-    let registry = &routes[0].1;
+    let registry = &routes[0].registry;
     let mut buffer = vec![0u8; MAX_DATAGRAM];
     let mut sweeps = tokio::time::interval(SWEEP_INTERVAL);
     sweeps.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // One table for every verified route on this socket. Entries carry the
+    // title they were opened for, and both routing and admission check it, so
+    // sharing the table across titles cannot let one admit another's host.
+    // It stays empty when no route is verified.
+    //
+    // Owned here, by the one task that touches it: no `Arc`, no lock.
+    let mut challenges = qr2_handler::Challenges::new();
     loop {
         let received = tokio::select! {
             biased;
             _ = sweeps.tick() => {
-                for (_, registry) in routes { sweep(registry); }
+                for route in routes { sweep(&route.registry); }
+                // Pending registrations expire on the same tick. This drops
+                // only unverified claims; an admitted session's deadline is
+                // the registry's and was swept above.
+                for (peer, instance_key) in challenges.sweep(Instant::now()) {
+                    registry.peer_event(
+                        "qr2",
+                        peer,
+                        &format!(
+                            "pending registration for instance {} expired unanswered; \
+                             nothing was listed",
+                            crate::observe::hex(&instance_key)
+                        ),
+                    );
+                }
                 continue;
             },
             received = socket.recv_from(&mut buffer) => received,
@@ -148,7 +311,9 @@ async fn serve(
             }
         };
         let datagram = &buffer[..length];
-        let available = routes.iter().find_map(|(name, _)| answer(datagram, name));
+        let available = routes
+            .iter()
+            .find_map(|route| answer(datagram, &route.title));
         match available {
             Some(reply) => {
                 let sent = socket.send_to(&reply, peer).await;
@@ -165,13 +330,44 @@ async fn serve(
             // port. QR2 is served; anything else is recorded and unanswered.
             None => {
                 let selected = if strict {
-                    route_qr2(routes, peer, datagram, Instant::now())
+                    // Why a datagram was not attributed, not merely that it
+                    // was not: a host naming a title this deployment does not
+                    // serve is a configuration or DNS problem, and used to
+                    // look exactly like a stray packet.
+                    route_qr2(routes, peer, datagram, Instant::now(), &challenges).inspect_err(
+                        |refusal| {
+                            registry.peer_event(
+                                "qr2",
+                                peer,
+                                &format!(
+                                    "drop trace: not routable to a configured title: {refusal}"
+                                ),
+                            );
+                        },
+                    )
                 } else {
-                    Some(0)
+                    Ok(0)
                 };
-                if selected.is_none_or(|index| {
-                    !qr2_handler::handle(qr2_socket, peer, datagram, &routes[index].1)
-                }) {
+                // Routable is not admitted. Which route a packet belongs to
+                // and whether it may list a session are separate decisions,
+                // and the second one lives in the handler.
+                let handled = match selected {
+                    Ok(index) => match &routes[index].verified {
+                        Some(title) => qr2_handler::handle_with_challenges(
+                            qr2_socket,
+                            peer,
+                            datagram,
+                            title,
+                            &routes[index].registry,
+                            &mut challenges,
+                        ),
+                        None => {
+                            qr2_handler::handle(qr2_socket, peer, datagram, &routes[index].registry)
+                        }
+                    },
+                    Err(_) => false,
+                };
+                if !handled {
                     registry.bytes(
                         "availability",
                         peer,
@@ -213,73 +409,228 @@ fn sweep(registry: &SharedRegistry) {
     }
 }
 
+/// Why a QR2 datagram could not be attributed to one configured title.
+///
+/// Every variant used to be a bare `None`, which the caller could only record
+/// as an unanswered datagram — so an operator could not tell a host naming a
+/// title this deployment does not serve (a DNS or configuration problem) from
+/// one whose instance key collides with a live session (a protocol problem)
+/// from a packet that was never QR2 at all.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Qr2Refusal {
+    NotQr2(gamespy_proto::qr2::Qr2Error),
+    /// A heartbeat whose key block is truncated.
+    MalformedKeyBlock(gamespy_proto::qr2::Qr2Error),
+    /// Two `gamename` keys in one heartbeat: a host claiming two titles.
+    RepeatedGamename,
+    UnknownTitle(String),
+    /// Rejected at startup by [`crate::distinct_titles`], so this means a
+    /// route list changed underneath that check.
+    AmbiguousTitle(String),
+    /// The title claimed is served here, but this source and instance key are
+    /// already a live session of a *different* title.
+    TitleConflictsWithLiveSession(String),
+    /// That title already holds this instance key for a different source
+    /// socket, and the registry keys on IP and instance alone.
+    InstanceHeldByAnotherSource(String),
+    /// No `gamename` to route on, and not a packet that may be bound to an
+    /// existing session.
+    NoTitleToRouteOn,
+    /// No `gamename`, and no single admitted or pending binding to attribute
+    /// it to.
+    ///
+    /// The pending count is why this is not just a live-session count: with
+    /// verified admission a host's **first** challenge response arrives before
+    /// it has any listable session, and is routed through the pending binding
+    /// its heartbeat opened. Without that, every first registration would be
+    /// refused here and verification could never complete.
+    NoSessionToAttributeTo {
+        live: usize,
+        pending: usize,
+    },
+    /// The title claimed is served here, but this source and instance key
+    /// already have a *pending* registration for a different title.
+    TitleConflictsWithPending(String),
+    /// This source and instance key resolve to one title through an admitted
+    /// session and a different one through a pending registration.
+    ///
+    /// Refused rather than resolved by precedence: whichever lookup ran first
+    /// would decide which title a packet belonged to, which is exactly the
+    /// kind of order dependence that makes a cross-title collision hard to
+    /// see.
+    AdmittedAndPendingDisagree {
+        admitted: String,
+        pending: String,
+    },
+}
+
+impl std::fmt::Display for Qr2Refusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotQr2(error) => write!(formatter, "not a QR2 host packet: {error}"),
+            Self::MalformedKeyBlock(error) => {
+                write!(formatter, "heartbeat key block refused: {error}")
+            }
+            Self::RepeatedGamename => {
+                formatter.write_str("heartbeat carries more than one gamename")
+            }
+            Self::UnknownTitle(name) => write!(
+                formatter,
+                "heartbeat names title {name:?}, which this listener does not serve"
+            ),
+            Self::AmbiguousTitle(name) => write!(
+                formatter,
+                "heartbeat names title {name:?}, which matches more than one configured route; \
+                 refusing rather than guessing a registry"
+            ),
+            Self::TitleConflictsWithLiveSession(name) => write!(
+                formatter,
+                "heartbeat names title {name:?}, but this source and instance key are already \
+                 a live session of another title"
+            ),
+            Self::InstanceHeldByAnotherSource(name) => write!(
+                formatter,
+                "title {name:?} already holds this instance key for a different source socket; \
+                 the registry keys on address and instance, so routing it would overwrite that \
+                 session"
+            ),
+            Self::NoTitleToRouteOn => formatter.write_str(
+                "no gamename to route on, and this type cannot be bound to an existing session",
+            ),
+            Self::NoSessionToAttributeTo { live, pending } => write!(
+                formatter,
+                "no gamename to route on, and {live} live session(s) and {pending} pending \
+                 registration(s) match this source and instance key, so there is no single \
+                 title to attribute it to"
+            ),
+            Self::TitleConflictsWithPending(name) => write!(
+                formatter,
+                "heartbeat names title {name:?}, but this source and instance key already \
+                 have a pending registration for another title"
+            ),
+            Self::AdmittedAndPendingDisagree { admitted, pending } => write!(
+                formatter,
+                "this source and instance key are an admitted session of title {admitted:?} \
+                 and a pending registration of title {pending:?}; refusing rather than \
+                 letting lookup order decide which one a nameless packet belongs to"
+            ),
+        }
+    }
+}
+
 /// Resolve only declared titles or existing exact socket bindings. The source IP
 /// alone is insufficient: two hosts can share a NAT and an instance key.
+///
+/// A nameless packet — a challenge response, a keepalive, a client-message
+/// acknowledgement, or a nameless exit — is resolved through an admitted
+/// session **or** a pending registration. Both are needed: a verified host's
+/// first challenge response has no listable session, and a pending-only
+/// host's keepalives and exits would otherwise be unroutable too.
+///
+/// Resolving a packet to a route says nothing about what it may do. A pending
+/// binding routes a keepalive so it can be recorded; the handler is what
+/// refuses to create a session from one.
 fn route_qr2(
-    routes: &[(String, SharedRegistry)],
+    routes: &[Route],
     peer: std::net::SocketAddr,
     datagram: &[u8],
     now: Instant,
-) -> Option<usize> {
+    challenges: &crate::qr2::Challenges,
+) -> Result<usize, Qr2Refusal> {
     use gamespy_proto::qr2::{HostPacket, parse_host_packet};
-    let packet = parse_host_packet(datagram).ok()?;
+    let packet = parse_host_packet(datagram).map_err(Qr2Refusal::NotQr2)?;
     let (key, name, exiting) = match &packet {
         HostPacket::Heartbeat { instance_key, keys } => {
-            keys.validate().ok()?;
+            keys.validate().map_err(Qr2Refusal::MalformedKeyBlock)?;
             let mut names = keys
                 .pairs()
                 .filter(|(k, _)| k.eq_ignore_ascii_case("gamename"));
             let name = names.next().map(|(_, v)| v);
             if names.next().is_some() {
-                return None;
+                return Err(Qr2Refusal::RepeatedGamename);
             }
             (*instance_key, name, keys.is_exiting())
         }
-        HostPacket::Keepalive { instance_key } | HostPacket::Reply { instance_key, .. } => {
-            (*instance_key, None, true)
-        }
+        HostPacket::Keepalive { instance_key }
+        | HostPacket::Reply { instance_key, .. }
+        | HostPacket::ClientMessageAck { instance_key, .. } => (*instance_key, None, true),
     };
     let id = crate::registry::SessionId::new(peer, key);
-    let existing: Vec<_> = routes
+    let admitted: Vec<_> = routes
         .iter()
         .enumerate()
-        .filter(|(_, (_, r))| {
-            r.listable(now)
+        .filter(|(_, route)| {
+            route
+                .registry
+                .listable(now)
                 .iter()
                 .any(|(held, data)| *held == id && data.source == peer)
         })
         .map(|(i, _)| i)
         .collect();
+    // The pending binding is keyed on the full source socket, so unlike the
+    // admitted lookup above it needs no separate `data.source == peer` test:
+    // the port is already part of the key.
+    let pending: Vec<_> = match challenges.pending_title(peer, key, now) {
+        Some(title) => routes
+            .iter()
+            .enumerate()
+            .filter(|(_, route)| route.title.eq_ignore_ascii_case(title))
+            .map(|(i, _)| i)
+            .collect(),
+        None => Vec::new(),
+    };
     if let Some(name) = name {
         let matches: Vec<_> = routes
             .iter()
             .enumerate()
-            .filter(|(_, (n, _))| n.eq_ignore_ascii_case(name))
+            .filter(|(_, route)| route.title.eq_ignore_ascii_case(name))
             .map(|(i, _)| i)
             .collect();
-        let [selected] = matches.as_slice() else {
-            return None;
+        let selected = match matches.as_slice() {
+            [selected] => *selected,
+            [] => return Err(Qr2Refusal::UnknownTitle(name.to_owned())),
+            _ => return Err(Qr2Refusal::AmbiguousTitle(name.to_owned())),
         };
-        if existing.iter().any(|i| i != selected) {
-            return None;
+        if admitted.iter().any(|i| *i != selected) {
+            return Err(Qr2Refusal::TitleConflictsWithLiveSession(name.to_owned()));
+        }
+        // A host mid-verification for one title must not be re-pointed at
+        // another by its next heartbeat, or a response to the outstanding
+        // challenge could be checked against the wrong secret.
+        if pending.iter().any(|i| *i != selected) {
+            return Err(Qr2Refusal::TitleConflictsWithPending(name.to_owned()));
         }
         // The legacy per-title registry keys IP/instance, so do not overwrite a
         // different live source socket using that same identity.
-        if routes[*selected]
-            .1
+        if routes[selected]
+            .registry
             .listable(now)
             .iter()
             .any(|(held, data)| *held == id && data.source != peer)
         {
-            return None;
+            return Err(Qr2Refusal::InstanceHeldByAnotherSource(name.to_owned()));
         }
-        Some(*selected)
+        Ok(selected)
     } else if exiting {
-        match existing.as_slice() {
-            [index] => Some(*index),
-            _ => None,
+        match (admitted.as_slice(), pending.as_slice()) {
+            // An admitted session and a pending re-verification of the same
+            // title: one route, nothing to disambiguate.
+            ([one], [other]) if one == other => Ok(*one),
+            ([one], [other]) => Err(Qr2Refusal::AdmittedAndPendingDisagree {
+                admitted: routes[*one].title.clone(),
+                pending: routes[*other].title.clone(),
+            }),
+            ([one], []) => Ok(*one),
+            // The first challenge response of a host that has never been
+            // listed arrives here, and this is the arm that routes it.
+            ([], [one]) => Ok(*one),
+            (admitted, pending) => Err(Qr2Refusal::NoSessionToAttributeTo {
+                live: admitted.len(),
+                pending: pending.len(),
+            }),
         }
     } else {
-        None
+        Err(Qr2Refusal::NoTitleToRouteOn)
     }
 }

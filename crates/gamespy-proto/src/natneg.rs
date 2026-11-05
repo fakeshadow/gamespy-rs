@@ -26,14 +26,82 @@ pub const CONNECT_LEN: usize = 20;
 /// Packet types, as the client's own dispatch names them by behaviour.
 pub mod packet_type {
     /// Sent by a peer that wants to be introduced. Built at `0x00ae2798`.
+    ///
+    /// A peer sends one INIT per port type and resends each on a timer until
+    /// that port type is acknowledged with [`INIT_ACK`].
     pub const INIT: u8 = 0;
+    /// What a negotiation server replies to every INIT it accepts.
+    ///
+    /// **This is the packet that ends a peer's INIT retry loop.** A peer that
+    /// is never acknowledged exhausts its own retry budget and reports the
+    /// negotiation as failed, whatever the server does later — so a CONNECT
+    /// alone cannot complete a negotiation with an SDK client.
+    ///
+    /// The value is `NN_INITACK` from the SDK's own `nninternal.h`, the
+    /// header the [crate docs](crate) already cite for the negotiation
+    /// labels. The client reads `porttype` out of the body, refuses the
+    /// packet if that value exceeds [`port_type::NEGOTIATION_3`], and marks
+    /// that one port type acknowledged; it leaves its retry loop only once
+    /// every port type it probed has been.
+    pub const INIT_ACK: u8 = 1;
     /// What the negotiation server sends to each peer with the other's
-    /// public address. The only thing that stops a peer resending INIT.
+    /// public address, once both sides have announced the same cookie.
     pub const CONNECT: u8 = 5;
-    /// Handled alongside CONNECT (`0x00ae34b4`), same minimum size.
+    /// What a peer sends back on receiving a [`CONNECT`], which is what tells
+    /// the server to stop resending it.
+    ///
+    /// `NN_CONNECT_ACK` from the same header. The client sends it only for a
+    /// CONNECT whose `finished` byte is `FINISHED_NOERROR`, which is why
+    /// [`connect`] must send that byte as zero.
+    pub const CONNECT_ACK: u8 = 6;
+    /// Handled alongside CONNECT (`0x00ae34b4`), same minimum size. Exchanged
+    /// between the peers themselves rather than with this service.
     pub const CONNECT_PING: u8 = 7;
-    /// Also handled (`0x00ae3924`); this project has not read its body.
+    /// What a peer sends the negotiation server when its negotiation ends,
+    /// win or lose, and **keeps resending until it is acknowledged**.
+    ///
+    /// `NN_REPORT` from `nninternal.h`. This is not a courtesy: the SDK's
+    /// `StartReport` sends it, enters `ns_reportsent`, and only fires the
+    /// title's `completedCallback` on [`REPORT_ACK`] — or after
+    /// `REPORT_RETRY_COUNT` (5) resends at `REPORT_RETRY_TIME` (1000 ms),
+    /// which it logs as `REPORT retry FAILED`. A server that never answers
+    /// therefore adds about five seconds to **every** negotiation it
+    /// successfully brokered before the game is told it may connect.
+    ///
+    /// The body is the SDK's `ReportPacket`: port type, client index,
+    /// `negResult`, `natType`, `natMappingScheme` and a 50-byte game name,
+    /// which is `REPORTPACKET_SIZE` (`BASEPACKET_SIZE + 61`) in all. It is
+    /// the only packet that says whether an introduction worked.
+    pub const REPORT: u8 = 13;
+    /// What a negotiation server answers a [`REPORT`] with, releasing the
+    /// peer from `ns_reportsent`.
+    ///
+    /// `NN_REPORT_ACK`, the last type this SDK generation defines.
+    pub const REPORT_ACK: u8 = 14;
+    /// Also handled (`0x00ae3924`); this project has not read its body. Not
+    /// present in the SDK generation `nninternal.h` documents, which ends at
+    /// `NN_REPORT_ACK` (14), so `0x10` is read from this client alone.
     pub const PREINIT_ACK: u8 = 0x10;
+}
+
+/// Which of a peer's sockets an INIT is announcing.
+///
+/// `NN_PT_*` from the SDK's `nninternal.h`. The ordering matters and is not
+/// what it looks like: **the game port is type 0**, and the three
+/// negotiation probes follow it. A peer sends one INIT per type and the
+/// address a partner must actually punch is the game port's, so the mapping
+/// to advertise is the *lowest* type a peer announced, not the highest.
+pub mod port_type {
+    /// `NN_PT_GP`: the socket the game itself uses, when the title gave the
+    /// SDK one. This is the mapping a partner has to reach.
+    pub const GAME: u8 = 0;
+    /// `NN_PT_NN1`, the first negotiation probe.
+    pub const NEGOTIATION_1: u8 = 1;
+    /// `NN_PT_NN2`.
+    pub const NEGOTIATION_2: u8 = 2;
+    /// `NN_PT_NN3`, the last type the client will accept an acknowledgement
+    /// for: it refuses an INIT_ACK naming anything above this.
+    pub const NEGOTIATION_3: u8 = 3;
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -85,14 +153,118 @@ pub struct Init {
     pub local_address: Option<SocketAddrV4>,
 }
 
+/// A peer reporting how its negotiation ended.
+///
+/// **Only the three fields below are readable.** The SDK builds this packet by
+/// assigning into a local `NatNegPacket` struct and sending `REPORTPACKET_SIZE`
+/// bytes of it, with no packing attribute and no zeroing, so what is on the
+/// wire is one compiler's struct layout over partly uninitialised stack:
+///
+/// - `porttype`, body offset 0, **is never assigned by `SendReportPacket`** —
+///   it is whatever was on the stack. It is deliberately not parsed here.
+/// - `natType` and `natMappingScheme` are C enums, so four host-order bytes
+///   each. The order is the reporting console's, not the protocol's, and this
+///   crate has no evidence for either value's meaning, so their eight bytes
+///   are carried as [`Report::nat_bytes`] rather than decoded.
+/// - the gamename's offset depends on there being no padding between those
+///   enums, which is what makes `REPORTPACKET_SIZE` the hand-computed
+///   `BASEPACKET_SIZE + 61`. It is read on that assumption and validated.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Report {
+    pub cookie: u32,
+    pub client_index: u8,
+    /// `negResult`, which despite the name is **not** a `NegotiateResult`:
+    /// `SendReportPacket` writes `neg->result == nr_success ? gsi_true :
+    /// gsi_false`, so the wire carries a boolean and the reason a negotiation
+    /// failed never leaves the console.
+    pub success: bool,
+    /// `natType` and `natMappingScheme` as sent, undecoded; see the type docs.
+    pub nat_bytes: Option<[u8; 8]>,
+    /// The reporting peer's game name, read up to the first NUL of the
+    /// 50-byte field.
+    ///
+    /// `None` when the field is absent, empty, or not UTF-8. The SDK copies
+    /// the name in only `if (strlen(__GSIACGamename) > 0)` and never clears
+    /// the field, so a nameless report carries 50 bytes of stack residue
+    /// here — which is why this is validated rather than trusted, and why it
+    /// is not used to route a report to a title's cookie space.
+    pub game_name: Option<String>,
+}
+
 /// A parsed negotiation packet.
+///
+/// Every type the protocol defines parses to one of these variants, so a
+/// listener can tell a packet it has no work for from a packet it does not
+/// recognise at all. [`NatNegError::UnhandledType`] is now reserved for the
+/// latter.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Packet {
     Init(Init),
+    /// A peer acknowledging the CONNECT it was sent. Only the cookie is read:
+    /// it is what names the negotiation being acknowledged, and the body has
+    /// not been traced in this project.
+    ConnectAck {
+        cookie: u32,
+    },
+    /// A peer reporting the outcome of its negotiation, which must be
+    /// acknowledged with [`report_ack`] or the peer stalls; see
+    /// [`packet_type::REPORT`].
+    Report(Report),
+    /// A type this protocol defines that a negotiation server receives but
+    /// acts on none of: its own [`packet_type::INIT_ACK`],
+    /// [`packet_type::CONNECT`] or [`packet_type::REPORT_ACK`] reflected
+    /// back, a [`packet_type::CONNECT_PING`] the peers exchange between
+    /// themselves, or a [`packet_type::PREINIT_ACK`].
+    ///
+    /// Recognised rather than refused so a listener records it as protocol
+    /// traffic instead of as a malformed datagram.
+    Unacted {
+        packet_type: u8,
+        cookie: u32,
+    },
 }
 
 /// Offset of the peer's own address inside an INIT body.
 pub const LOCAL_ADDRESS_OFFSET: usize = 15;
+
+/// Length of a complete REPORT: the SDK's `REPORTPACKET_SIZE`,
+/// `BASEPACKET_SIZE + 61`.
+pub const REPORT_LEN: usize = HEADER_LEN + 61;
+
+/// Offset of the `natType`/`natMappingScheme` pair inside a REPORT.
+const REPORT_NAT_OFFSET: usize = HEADER_LEN + 3;
+
+/// Offset of the 50-byte game name inside a REPORT.
+const REPORT_NAME_OFFSET: usize = REPORT_NAT_OFFSET + 8;
+
+/// Read the fields of a REPORT that are safe to read; see [`Report`].
+///
+/// Lenient about length on purpose: a peer that sent a short report is still
+/// waiting for an acknowledgement, and refusing to parse one would mean
+/// refusing to release it. Absent fields are reported absent.
+pub fn report_of(datagram: &[u8]) -> Option<Report> {
+    let cookie = cookie_of(datagram)?;
+    let game_name = datagram
+        .get(REPORT_NAME_OFFSET..REPORT_NAME_OFFSET + 50)
+        .and_then(|field| {
+            let end = field.iter().position(|byte| *byte == 0)?;
+            let name = std::str::from_utf8(&field[..end]).ok()?;
+            (!name.is_empty()).then(|| name.to_owned())
+        });
+    Some(Report {
+        cookie,
+        client_index: datagram.get(13).copied().unwrap_or(0),
+        success: datagram.get(14).copied().unwrap_or(0) != 0,
+        nat_bytes: datagram
+            .get(REPORT_NAT_OFFSET..REPORT_NAT_OFFSET + 8)
+            .map(|bytes| {
+                let mut copy = [0u8; 8];
+                copy.copy_from_slice(bytes);
+                copy
+            }),
+        game_name,
+    })
+}
 
 /// Length of an INIT that carries a complete local address.
 pub const INIT_WITH_ADDRESS_LEN: usize = LOCAL_ADDRESS_OFFSET + 6;
@@ -153,20 +325,115 @@ pub fn parse(datagram: &[u8]) -> Result<Packet, NatNegError> {
                 local_address,
             }))
         }
+        packet_type::CONNECT_ACK => Ok(Packet::ConnectAck { cookie }),
+        packet_type::REPORT => Ok(Packet::Report(
+            report_of(datagram).ok_or(NatNegError::TooShort)?,
+        )),
+        packet_type::INIT_ACK
+        | packet_type::REPORT_ACK
+        | packet_type::CONNECT
+        | packet_type::CONNECT_PING
+        | packet_type::PREINIT_ACK => Ok(Packet::Unacted {
+            packet_type,
+            cookie,
+        }),
         other => Err(NatNegError::UnhandledType(other)),
     }
 }
 
+/// Build the INIT_ACK that ends a peer's INIT retry loop.
+///
+/// Takes the INIT being acknowledged rather than its fields, because the
+/// reply is that INIT with one byte changed: the peer's own version byte, its
+/// cookie and the nine body bytes of the SDK's `InitPacket` — port type,
+/// client index, `usegameport`, four bytes of local address and a two-byte
+/// local port — are echoed, and only the type byte becomes
+/// [`packet_type::INIT_ACK`].
+///
+/// Exactly [`INIT_WITH_ADDRESS_LEN`] bytes, which is the SDK's own
+/// `INITPACKET_SIZE` (`BASEPACKET_SIZE + 9`): that is the length every
+/// init-family packet is sent at, so it is the length an acknowledgement is
+/// read at. A shorter INIT is padded with zeroes to it, and a title name
+/// appended past the body is **not** echoed — it is not part of `InitPacket`,
+/// and the structure the client reads this packet into has no room for it.
+///
+/// The one field the client must recover is the port type: it tracks
+/// acknowledgement per type, a peer probes several, and it refuses an
+/// acknowledgement whose type exceeds [`port_type::NEGOTIATION_3`].
+///
+/// The version byte is echoed rather than set to [`VERSION`] because echoing
+/// is free and cannot disagree with the peer. It is **not** load-bearing:
+/// `NNProcessData` checks the magic and nothing else, and `NN_PROTVER` is
+/// never compared on receive in the referenced SDK, which is also why
+/// [`parse`] does not gate on it and why [`connect`] can send [`VERSION`]
+/// outright.
+///
+/// `None` when the datagram is shorter than a header, which is not an INIT.
+pub fn init_ack(init: &[u8]) -> Option<Vec<u8>> {
+    if init.len() < HEADER_LEN {
+        return None;
+    }
+    let mut packet = Vec::with_capacity(INIT_WITH_ADDRESS_LEN);
+    packet.extend_from_slice(&MAGIC);
+    packet.push(init[6]);
+    packet.push(packet_type::INIT_ACK);
+    packet.extend_from_slice(&init[8..HEADER_LEN]);
+    let body = init
+        .get(HEADER_LEN..INIT_WITH_ADDRESS_LEN)
+        .unwrap_or(&init[HEADER_LEN..]);
+    packet.extend_from_slice(body);
+    packet.resize(INIT_WITH_ADDRESS_LEN, 0);
+    debug_assert_eq!(packet.len(), INIT_WITH_ADDRESS_LEN);
+    Some(packet)
+}
+
+/// Build the REPORT_ACK that releases a peer from `ns_reportsent`.
+///
+/// Takes the REPORT being acknowledged, for the same reasons [`init_ack`]
+/// takes the INIT: the peer's own version byte and cookie are echoed, the
+/// body is echoed, and only the type byte changes. The acknowledgement is
+/// sent at the report's own length — padded up to [`REPORT_LEN`], the length
+/// every report is sent at — rather than as a bare header, because what the
+/// client reads this into is a fixed `NatNegPacket` and this project has not
+/// read whether its init-family dispatch imposes a minimum length.
+///
+/// Echoing the body also means the acknowledgement cannot disagree with the
+/// report about anything, including the fields [`Report`] deliberately does
+/// not interpret.
+///
+/// `None` when the datagram is shorter than a header, which is not a report.
+pub fn report_ack(report: &[u8]) -> Option<Vec<u8>> {
+    if report.len() < HEADER_LEN {
+        return None;
+    }
+    let mut packet = Vec::with_capacity(REPORT_LEN);
+    packet.extend_from_slice(&MAGIC);
+    packet.push(report[6]);
+    packet.push(packet_type::REPORT_ACK);
+    packet.extend_from_slice(&report[8..HEADER_LEN]);
+    let body = report
+        .get(HEADER_LEN..REPORT_LEN)
+        .unwrap_or(&report[HEADER_LEN..]);
+    packet.extend_from_slice(body);
+    packet.resize(REPORT_LEN, 0);
+    debug_assert_eq!(packet.len(), REPORT_LEN);
+    Some(packet)
+}
+
 /// Build the CONNECT that introduces a peer to its counterpart.
 ///
-/// Twenty bytes exactly, which is the minimum the client accepts: the
-/// twelve-byte header, then the counterpart's public address as four bytes of
-/// IPv4 and a two-byte port, then two flag bytes.
+/// Twenty bytes exactly, which is both the minimum this client accepts
+/// (`0x00ae34bc`) and the SDK's `CONNECTPACKET_SIZE` (`BASEPACKET_SIZE + 8`):
+/// the twelve-byte header, then the counterpart's public address as four
+/// bytes of IPv4 and a two-byte port, then `gotyourdata` and `finished`.
 ///
-/// **The two flag bytes are inferred, not read.** The client's handling of
-/// the body past the address has not been traced in this project, so they are
-/// sent as zero — the value that asks for nothing. Everything else here is
-/// read from the binary.
+/// **The `finished` byte must be zero.** That is `FINISHED_NOERROR`, and the
+/// client acknowledges a CONNECT only when the byte holds it — any other
+/// value is an error report it does not answer, so a non-zero byte here
+/// would leave this service resending an introduction forever. `gotyourdata`
+/// is sent as zero too, the value that asks for nothing; it belongs to the
+/// peer-to-peer exchange that follows and this project has not traced the
+/// client's use of it.
 pub fn connect(cookie: u32, peer_address: [u8; 4], peer_port: u16) -> Vec<u8> {
     let mut packet = Vec::with_capacity(CONNECT_LEN);
     packet.extend_from_slice(&MAGIC);
@@ -271,7 +538,12 @@ pub fn parse_named_init_detailed(datagram: &[u8]) -> Result<(Init, &str), NamedI
     if datagram.len() < 23 {
         return Err(NamedInitRefusal::TooShort(datagram.len()));
     }
-    let Packet::Init(init) = parse(datagram).map_err(NamedInitRefusal::NotInit)?;
+    let parsed = parse(datagram).map_err(NamedInitRefusal::NotInit)?;
+    let Packet::Init(init) = parsed else {
+        return Err(NamedInitRefusal::NotInit(NatNegError::UnhandledType(
+            datagram[7],
+        )));
+    };
     let tail = &datagram[21..];
     let end = tail
         .iter()

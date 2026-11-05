@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use gamespy_proto::browser::{self, ListRequest};
 use gamespy_proto::browser_crypt::{self, KEY_LEN};
 use gamespy_proto::browser_response::{self, ListedServer};
+use gamespy_proto::qr2;
 
 /// The socket a relay leaves from.
 ///
@@ -35,7 +36,33 @@ pub struct Relay {
     /// Rendered once, because a relay's source address is the thing that
     /// decides whether a host behind a restrictive NAT ever sees it.
     origin: Arc<str>,
+    /// Relayed messages not yet acknowledged, keyed by the host they went to,
+    /// its instance key and the message id. See [`Relay::acknowledge`].
+    outstanding: Arc<std::sync::Mutex<std::collections::HashSet<RelayKey>>>,
 }
+
+/// What names one relayed client message: the host it was sent to, the
+/// instance key it was addressed with, and its own id.
+type RelayKey = (SocketAddr, qr2::InstanceKey, qr2::MessageId);
+
+/// How many copies of one relayed client message are sent before this service
+/// stops.
+///
+/// More than one because the message is the only thing that starts a
+/// negotiation, it is a single unacknowledged datagram, and a host that never
+/// receives it leaves the joining peer sending INITs into silence. Bounded,
+/// and safe at any count, because the host answers **every** copy whose
+/// instance key matches and `qr_got_recent_message` keeps it from acting on
+/// one id twice — so a resend costs a duplicate ack and nothing else.
+const RELAY_ATTEMPTS: u32 = 4;
+
+/// How long between those copies.
+///
+/// Four attempts at this interval span about 1.5 s, well inside the roughly
+/// five seconds the joining peer spends retrying its own INITs
+/// (`INIT_RETRY_TIME` 500 ms × `INIT_RETRY_COUNT` 10), so the last copy can
+/// still start a negotiation the peer is waiting on.
+const RELAY_RETRY: Duration = Duration::from_millis(500);
 
 impl Relay {
     /// Clone the socket destined for [`crate::availability::spawn_with_socket`].
@@ -59,12 +86,50 @@ impl Relay {
         Ok(Self {
             socket: Arc::new(socket),
             origin: origin.into(),
+            outstanding: Arc::default(),
         })
     }
 
     /// Where relays leave from, as a host sees it.
     pub fn origin(&self) -> &str {
         &self.origin
+    }
+
+    /// Stop resending a relayed client message, because the host has
+    /// acknowledged it. `true` if a copy was still outstanding.
+    ///
+    /// A host answers every client message it accepts with
+    /// [`gamespy_proto::qr2::packet_type::CLIENT_MESSAGE_ACK`], which
+    /// [`gamespy_proto::qr2::parse_host_packet`] reads as
+    /// [`gamespy_proto::qr2::HostPacket::ClientMessageAck`]. Those acks arrive
+    /// on the QR2 socket, which this listener does not read, so an application
+    /// that wants the resends to stop early passes them here from wherever it
+    /// calls [`crate::qr2::handle`]:
+    ///
+    /// ```ignore
+    /// if let Ok(HostPacket::ClientMessageAck { instance_key, message_id }) =
+    ///     qr2::parse_host_packet(datagram)
+    /// {
+    ///     relay.acknowledge(peer, instance_key, message_id);
+    /// }
+    /// ```
+    ///
+    /// Calling it is an optimisation, not a requirement: resending a message
+    /// id the host has already acted on costs a duplicate acknowledgement and
+    /// nothing more, which is why [`RELAY_ATTEMPTS`] is safe on its own.
+    pub fn acknowledge(
+        &self,
+        host: SocketAddr,
+        instance_key: qr2::InstanceKey,
+        message_id: qr2::MessageId,
+    ) -> bool {
+        self.lock().remove(&(host, instance_key, message_id))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<RelayKey>> {
+        self.outstanding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Hand one packet to the kernel. Success is not delivery: UDP reports
@@ -129,6 +194,10 @@ pub fn spawn_multi_with_listener(
     if routes.is_empty() {
         return Err("browser needs at least one title".into());
     }
+    crate::distinct_titles(
+        "browser",
+        routes.iter().map(|(config, _)| config.game_name.as_str()),
+    )?;
     // One socket for the listener's life either way, rather than one bound and
     // closed per relayed message, which a client could otherwise drive.
     let relay = match relay {
@@ -183,42 +252,83 @@ async fn serve_connection(
         }
     };
 
+    // The query game selects the route, and with it the secret and registry.
+    // Both refusals below are recorded against route 0's observer, the same
+    // one the frame trace above used: until a route is selected there is no
+    // title-specific observer to use, and a dropped request with no trace is
+    // indistinguishable from a client that never connected.
     let mut candidates = routes
         .iter()
         .filter(|(config, _)| request.for_game.eq_ignore_ascii_case(&config.game_name));
-    let Some((config, registry)) = candidates.next() else {
+    let Some((config, selected)) = candidates.next() else {
+        registry.peer_event(
+            "browser",
+            peer,
+            &format!(
+                "drop trace: request searches title {:?}, which this listener does not serve \
+                 (serving {})",
+                request.for_game,
+                routes
+                    .iter()
+                    .map(|(config, _)| config.game_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        );
         return;
     };
     if candidates.next().is_some() {
+        // Rejected at startup by `distinct_titles`, so reaching this means a
+        // route list changed underneath that check rather than a client doing
+        // anything unusual.
+        registry.peer_event(
+            "browser",
+            peer,
+            &format!(
+                "drop trace: request searches title {:?}, which matches more than one \
+                 configured route; refusing rather than guessing which registry to answer from",
+                request.for_game,
+            ),
+        );
         return;
     }
+    let registry = selected;
 
     registry.peer_event(
         "browser",
         peer,
         &format!(
-            "request metadata: type={} protocol={} encoding={} game_version={} from={:?} options={:#010x} trailing={} fields={:?}",
+            "request metadata: type={} protocol={} encoding={} game_version={} from={:?} \
+             options={:#010x} (no_server_list={} push_updates={} send_groups={} \
+             no_list_cache={} send_fields_for_all={}) source_ip={} max_servers={} \
+             trailing={} fields={:?}",
             request.request_type,
             request.protocol_version,
             request.encoding_version,
             request.game_version,
             request.from_game,
             request.options,
+            request.wants_no_list(),
+            request.has_option(browser::options::PUSH_UPDATES),
+            request.has_option(browser::options::SEND_GROUPS),
+            request.has_option(browser::options::NO_LIST_CACHE),
+            request.has_option(browser::options::SEND_FIELDS_FOR_ALL),
+            match request.source_ip {
+                Some([a, b, c, d]) => format!("{a}.{b}.{c}.{d}"),
+                None => "absent".into(),
+            },
+            match request.max_servers {
+                Some(max) => max.to_string(),
+                None => "absent".into(),
+            },
             observe::hex(request.trailing),
             request.fields,
         ),
     );
 
-    // Answer only for the title this deployment serves, and only for the
-    // request type this service understands.
-    if !request.for_game.eq_ignore_ascii_case(&config.game_name) {
-        registry.peer_event(
-            "browser",
-            peer,
-            &format!("request for another title ({}); ignored", request.for_game),
-        );
-        return;
-    }
+    // The title was checked by the route filter above, which is what `config`
+    // came from; re-testing it here could never fail. Only the request type
+    // is left to refuse.
     if request.request_type != browser::REQUEST_TYPE_LIST {
         registry.peer_event(
             "browser",
@@ -259,7 +369,12 @@ async fn serve_connection(
     registry.peer_event(
         "browser",
         peer,
-        &if listed == 0 {
+        &if request.wants_no_list() {
+            format!(
+                "header sent ({} bytes, no server list requested)",
+                reply.len()
+            )
+        } else if listed == 0 {
             format!("empty list sent ({} bytes, 0 servers)", reply.len())
         } else {
             format!("list sent ({} bytes, {listed} servers)", reply.len())
@@ -469,47 +584,111 @@ async fn relay_to_host(
         return;
     };
 
-    let packet = gamespy_proto::qr2::client_message(instance_key, message);
-    // Sent on the relay socket rather than a fresh one, so the host sees it
-    // coming from the address it heartbeats to. Logged as sent, not delivered:
-    // UDP says nothing, and a NAT may still drop what the kernel accepted.
-    match context.relay.send_to(&packet, source) {
-        Ok(_) => {
-            registry.peer_event(
-                "browser",
-                peer,
-                &format!(
-                    "relay sent: {} bytes to the host at {source}, from {}",
-                    message.len(),
-                    context.relay.origin()
-                ),
-            );
-            // The whole negotiation starts here: this message is what tells a
-            // host to begin. It is sent once, carries no message id, and no
-            // acknowledgement is matched to it, so a single lost datagram
-            // leaves the joining peer sending INITs to a host that never
-            // negotiates. Recorded with the host's own negotiation fields,
-            // which nothing else in this service reads.
-            registry.peer_event(
-                "browser",
-                peer,
-                &format!(
-                    "relay trace: instance={} target={source} requested_port={port} \
-                     matched_on={matched_on} natneg_key={natneg} localport={} payload={}; \
-                     sent once, unacknowledged and not retried",
-                    crate::observe::hex(&instance_key),
-                    match local_port {
-                        Some(port) => port.to_string(),
-                        None => "absent".into(),
-                    },
-                    crate::observe::hex(message),
-                ),
-            );
+    // The id the host dedupes and acknowledges on. It is a header field the
+    // host strips before the game sees the message, not part of the payload,
+    // so every copy of this message must carry this same value and a
+    // different message must carry a different one. Random rather than a
+    // counter so two listeners sharing one QR2 socket cannot collide inside
+    // the host's recent-message window.
+    let mut message_id = qr2::MessageId::default();
+    if registry.fill_random(&mut message_id).is_err() {
+        registry.peer_event(
+            "browser",
+            peer,
+            "relay refused: no random source for a client message id",
+        );
+        return;
+    }
+
+    // The whole negotiation starts here: this message is what tells a host to
+    // begin. Recorded with the host's own negotiation fields, which nothing
+    // else in this service reads.
+    registry.peer_event(
+        "browser",
+        peer,
+        &format!(
+            "relay trace: instance={} message_id={} target={source} requested_port={port} \
+             matched_on={matched_on} natneg_key={natneg} localport={} payload={}; \
+             up to {RELAY_ATTEMPTS} copies every {} ms until the host's client_message_ack",
+            crate::observe::hex(&instance_key),
+            crate::observe::hex(&message_id),
+            match local_port {
+                Some(port) => port.to_string(),
+                None => "absent".into(),
+            },
+            crate::observe::hex(message),
+            RELAY_RETRY.as_millis(),
+        ),
+    );
+
+    let packet = qr2::client_message(instance_key, message_id, message);
+    let relay = context.relay.clone();
+    let key = (source, instance_key, message_id);
+    relay.lock().insert(key);
+
+    // The first copy goes out before this returns, so a caller that drives
+    // one relay and then looks at the wire sees it, and so nothing about
+    // delivering a message at all depends on a task being scheduled.
+    send_relay_copy(registry, &relay, peer, source, &packet, 1);
+    if RELAY_ATTEMPTS <= 1 {
+        relay.lock().remove(&key);
+        return;
+    }
+
+    // The rest are spawned: the client may send further follow-ups on this
+    // connection, and waiting out the resends here would hold them up.
+    let registry = registry.clone();
+    tokio::spawn(async move {
+        for attempt in 2..=RELAY_ATTEMPTS {
+            tokio::time::sleep(RELAY_RETRY).await;
+            // Cleared by Relay::acknowledge when the application feeds the
+            // host's ack back from the QR2 socket.
+            if !relay.lock().contains(&key) {
+                registry.peer_event(
+                    "browser",
+                    peer,
+                    &format!(
+                        "relay acknowledged by the host after {} copy(ies); not resending",
+                        attempt - 1
+                    ),
+                );
+                return;
+            }
+            send_relay_copy(&registry, &relay, peer, source, &packet, attempt);
         }
+        relay.lock().remove(&key);
+    });
+}
+
+/// Hand one copy of a relayed client message to the kernel and record it.
+///
+/// Sent on the relay socket rather than a fresh one, so the host sees it
+/// coming from the address it heartbeats to. Recorded as sent, not delivered:
+/// UDP reports nothing, and a NAT may still drop what the kernel accepted —
+/// which is the whole reason there is more than one copy.
+fn send_relay_copy(
+    registry: &SharedRegistry,
+    relay: &Relay,
+    peer: SocketAddr,
+    source: SocketAddr,
+    packet: &[u8],
+    attempt: u32,
+) {
+    match relay.send_to(packet, source) {
+        Ok(_) => registry.peer_event(
+            "browser",
+            peer,
+            &format!(
+                "relay sent: {} bytes to the host at {source}, from {} \
+                 (copy {attempt} of {RELAY_ATTEMPTS})",
+                packet.len(),
+                relay.origin(),
+            ),
+        ),
         Err(error) => registry.peer_event(
             "browser",
             peer,
-            &format!("relay to {source} failed: {error}"),
+            &format!("relay copy {attempt} to {source} failed: {error}"),
         ),
     }
 }
@@ -641,21 +820,71 @@ pub fn build_list_reply(
     peer: IpAddr,
     registry: &SharedRegistry,
 ) -> Option<(Vec<u8>, browser_crypt::Cipher, Vec<String>, usize)> {
-    let peer_ip = peer_octets(peer)?;
-    let candidates = registry.listable(Instant::now());
-    let candidate_count = candidates.len();
-    let selected = registry.select(request.filter, candidates);
-    registry.event(
-        "browser",
-        &format!(
-            "selection trace: peer={peer} candidates={candidate_count} selected={}",
-            selected.len()
-        ),
-    );
-    let sessions: Vec<ListedSession> = selected
-        .into_iter()
-        .filter_map(|(id, data)| peer_octets(id.peer_ip).map(|address| (address, data.keys)))
-        .collect();
+    // The client's own source address wins over the connection's when it
+    // asked for that: a client behind a proxy is telling us which address its
+    // reply header should name back at it.
+    let peer_ip = request.source_ip.or_else(|| peer_octets(peer))?;
+    // NO_SERVER_LIST means this connection was opened to issue a follow-up —
+    // a server-info request, or the send-message that starts a negotiation —
+    // and the client is not waiting for a list. Its parser reads the header
+    // and then push messages, so a list sent anyway is handed to a state
+    // machine that is not expecting one.
+    let sessions: Vec<ListedSession> = if request.wants_no_list() {
+        registry.event(
+            "browser",
+            &format!(
+                "selection trace: peer={peer} skipped, the request sets NO_SERVER_LIST \
+                 (options {:#010x}) and wants only the header",
+                request.options
+            ),
+        );
+        // The SDK's fixed-header state consumes the address and port, then
+        // switches directly to push messages for NO_SERVER_LIST. Even empty
+        // key/value tables or a list terminator would corrupt that framing.
+        let mut payload = Vec::with_capacity(6);
+        payload.extend_from_slice(&peer_ip);
+        payload.extend_from_slice(&registry.query_port().to_be_bytes());
+        let (sealed, cipher) = seal_streaming(request, secret, &payload, registry)?;
+        return Some((sealed, cipher, Vec::new(), 0));
+    } else {
+        let candidates = registry.listable(Instant::now());
+        let candidate_count = candidates.len();
+        let selected = registry.select(request.filter, candidates);
+        registry.event(
+            "browser",
+            &format!(
+                "selection trace: peer={peer} candidates={candidate_count} selected={} \
+                 limit={}",
+                selected.len(),
+                match request.max_servers {
+                    Some(max) => max.to_string(),
+                    None => "none".into(),
+                },
+            ),
+        );
+        let mut sessions: Vec<ListedSession> = selected
+            .into_iter()
+            .filter_map(|(id, data)| peer_octets(id.peer_ip).map(|address| (address, data.keys)))
+            .collect();
+        // LIMIT_RESULT_COUNT is the client saying how many entries it has
+        // room for. Truncating is the whole point of the field; sending more
+        // is what it asked us not to do.
+        if let Some(max) = request.max_servers {
+            let max = max as usize;
+            if sessions.len() > max {
+                registry.event(
+                    "browser",
+                    &format!(
+                        "limit trace: peer={peer} {} selected, the request's \
+                         LIMIT_RESULT_COUNT allows {max}; dropping the rest",
+                        sessions.len()
+                    ),
+                );
+                sessions.truncate(max);
+            }
+        }
+        sessions
+    };
     // With nothing to list, send the byte-for-byte reply a console already
     // accepted in attempt 5: no keys, no value table, no servers. Declaring
     // keys with no entries would be a shape no console has ever seen, and
@@ -800,9 +1029,12 @@ fn seal_streaming(
     payload: &[u8],
     registry: &SharedRegistry,
 ) -> Option<(Vec<u8>, browser_crypt::Cipher)> {
-    let mut block1 = [0u8; browser_response::BLOCK1_LEN];
+    // Block 1 is the backend game flags, which the client keeps and acts on
+    // when it queries game hosts, so it is a deliberate value and not a
+    // random one; block 2 is pure key salt and is. Filling block 1 randomly
+    // set QR2_USE_QUERY_CHALLENGE on roughly half of all replies.
+    let block1 = browser_response::NO_BACKEND_GAME_FLAGS;
     let mut block2 = [0u8; BLOCK2_LEN];
-    registry.fill_random(&mut block1).ok()?;
     registry.fill_random(&mut block2).ok()?;
     let mut challenge = [0u8; KEY_LEN];
     challenge.copy_from_slice(&request.challenge);

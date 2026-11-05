@@ -35,10 +35,13 @@ fn short_packets_are_refused_rather_than_indexed() {
     }
 }
 
+/// `0x0B` is past every type the referenced SDK's `qr2.c` defines, so it is
+/// genuinely unknown. `0x07` used to stand in here and is now the
+/// client-message acknowledgement.
 #[test]
 fn an_unhandled_type_is_named_in_the_error() {
-    let packet = [0x07, 1, 2, 3, 4];
-    assert_eq!(parse_host_packet(&packet), Err(Qr2Error::UnknownType(0x07)));
+    let packet = [0x0B, 1, 2, 3, 4];
+    assert_eq!(parse_host_packet(&packet), Err(Qr2Error::UnknownType(0x0B)));
 }
 
 /// Key block shape is static evidence, so this fixture is built to the

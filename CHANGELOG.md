@@ -1,4 +1,6 @@
-# unrelease
+# unrelease 0.1.2
+
+- bug fix
 
 ## 0.1.1
 

@@ -22,15 +22,45 @@ const MAX_DATAGRAM: usize = 65_535;
 /// How much of a datagram goes into one log line.
 const MAX_LOGGED_BYTES: usize = 256;
 
-/// How long a half-finished negotiation is kept.
+/// How long a side of a negotiation is kept without hearing from it again.
 ///
-/// A peer that announced a cookie and never got a partner is not useful
-/// afterwards, and the client gives up on its own once its INIT resends time
-/// out. This only has to outlive that.
+/// Measured from the last packet this service accepted from that side, so a
+/// peer that is still resending, or that has just acknowledged a CONNECT,
+/// keeps its entry alive.
+///
+/// This window is what it is **because every INIT is acknowledged**, and it
+/// is the client's own: the SDK starts a `PARTNER_WAIT_TIME` of 60 000 ms
+/// when the acknowledgements complete and it advances to `ns_initack`. Before
+/// then it is in `ns_initsent`, where `INIT_RETRY_TIME` 500 ms and
+/// `INIT_RETRY_COUNT` 10 give it about five seconds in total — so an
+/// unacknowledged peer is gone in five seconds and holding its entry for a
+/// minute would only offer the next peer a corpse to pair with. Acknowledging
+/// the INIT is what makes a minute the right number.
 const PENDING_TTL: Duration = Duration::from_secs(60);
 
 /// How often the socket wakes to expire stale cookies when nothing arrives.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long between resends of a CONNECT a peer has not acknowledged.
+///
+/// A CONNECT needs resending by this service because acknowledging INIT
+/// stops the peer resending the INIT that used to prompt one: a single lost
+/// CONNECT would otherwise end the negotiation silently.
+///
+/// The cadence is the SDK's own `INIT_RETRY_TIME`, the interval its retry
+/// loops use for init-family packets. Which timer the reference negotiation
+/// server used for this has not been read; this is the protocol's own
+/// number rather than one chosen here.
+const CONNECT_RETRY: Duration = Duration::from_millis(500);
+
+/// How many CONNECTs one side is sent before this service stops resending.
+///
+/// `INIT_RETRY_COUNT` from the same header, so the attempts span about five
+/// seconds. Bounded so a peer that has gone away cannot hold a socket
+/// resending into nothing, and well inside the 60 s the acknowledged peer
+/// spends waiting, so [`PENDING_TTL`] remains what decides when a
+/// negotiation is over.
+const CONNECT_ATTEMPTS: u32 = 10;
 
 /// One side of a negotiation.
 #[derive(Clone, Debug)]
@@ -62,6 +92,24 @@ struct Side {
     first_seen: Instant,
     /// How many INITs this index has sent for this cookie.
     inits: u32,
+    /// Delivery state of the CONNECT this side has been sent, if it has been
+    /// paired. Carried across resends like the rest of the history.
+    connect: Option<Connect>,
+}
+
+/// Delivery of one CONNECT, which this service must retry until the peer
+/// acknowledges it.
+#[derive(Clone, Debug)]
+struct Connect {
+    /// The address this side was told to punch. A CONNECT naming a different
+    /// address is a different introduction and restarts delivery.
+    partner: SocketAddrV4,
+    /// How many have been sent, including the one in flight.
+    attempts: u32,
+    last_sent: Instant,
+    /// Set by the peer's CONNECT_ACK, which is the only thing that stops the
+    /// resends.
+    acknowledged: bool,
 }
 
 /// What recording a side revealed, beyond who to introduce it to.
@@ -194,19 +242,23 @@ fn anomalies(previous: &Side, current: &Side) -> Vec<Anomaly> {
 /// Which public mapping a CONNECT advertises for a peer whose sockets are
 /// mapped separately.
 ///
-/// **This is a policy, not a reading.** The SDK's port types ascend from the
-/// negotiation sockets to the game port, so the highest type a peer has
-/// announced is the one most likely to be the socket the game itself listens
-/// on — which is the address a partner must punch. Which numeric value is the
-/// game port has *not* been read from this client, so this is the one choice
-/// here made on SDK convention rather than evidence. It is deliberate and
-/// deterministic, which arrival order was not, and when the mappings all
-/// agree it cannot matter. Confirming it is a binary read
-/// (`NNBeginNegotiation`'s port-type loop).
+/// The **lowest** port type the peer has announced, because the SDK's port
+/// types do not ascend to the game port — they descend from it. `NN_PT_GP`,
+/// the socket the game itself uses and the one a partner has to punch, is
+/// type 0; the three negotiation probes are 1 to 3 (see
+/// [`natneg::port_type`]). A peer that gave the SDK its game socket
+/// announces it under type 0 and that mapping wins; one that did not
+/// announce a game port falls back to its lowest negotiation probe, which is
+/// the only socket it has.
+///
+/// This used to take the highest type, on the assumption that the game port
+/// was the last of them. That is backwards, and it meant a peer whose NAT
+/// maps its sockets separately — the case this whole service exists for —
+/// was advertised at a negotiation mapping its partner could not use.
 fn advertised_mapping(side: &Side) -> SocketAddr {
     side.mappings
         .iter()
-        .next_back()
+        .next()
         .map(|(_, address)| *address)
         .unwrap_or(side.address)
 }
@@ -314,6 +366,34 @@ struct Pending {
     sides: HashMap<(String, u32), HashMap<SideKey, Side>>,
 }
 
+/// A CONNECT this service owes a peer another copy of, claimed from the
+/// registry by whichever socket thread ran the retry pass.
+#[derive(Clone, Debug)]
+struct DueConnect {
+    title: String,
+    cookie: u32,
+    client_index: u8,
+    socket: usize,
+    target: SocketAddr,
+    partner: SocketAddrV4,
+    attempt: u32,
+    /// The last attempt this service will make, so a capture records that
+    /// delivery was given up on rather than merely going quiet.
+    final_attempt: bool,
+}
+
+/// What a CONNECT_ACK settled.
+#[derive(Clone, Debug)]
+struct Acked {
+    title: String,
+    client_index: u8,
+    attempts: u32,
+    partner: SocketAddrV4,
+    /// An acknowledgement for a CONNECT already acknowledged: the peer
+    /// duplicated it, which is harmless and worth seeing.
+    repeated: bool,
+}
+
 impl Pending {
     /// Record a peer and return the counterpart to introduce it to, if the
     /// other side is already here.
@@ -342,21 +422,30 @@ impl Pending {
             for (port_type, address) in &previous.mappings {
                 side.mappings.entry(*port_type).or_insert(*address);
             }
+            // A resend is the same side, so whatever CONNECT it has already
+            // been sent is still the one in flight: losing this would resend
+            // an introduction the peer has acknowledged.
+            side.connect = previous.connect.clone();
         }
         // The INIT just received is the current mapping for its own port
         // type, overriding anything carried forward for it.
         side.mappings.insert(side.port_type, side.address);
         let current = side.clone();
         sides.insert(key, side);
-        // The oldest other side, not an arbitrary one: with three or more
-        // entries a HashMap walk would pair a different peer on each INIT.
-        // The peer that has been waiting longest is both deterministic and
-        // the one closest to giving up.
-        let partner = sides
-            .iter()
-            .filter(|(held, _)| **held != key)
-            .min_by_key(|(held, side)| (side.first_seen, held.client_index, held.host))
-            .map(|(_, held)| held.clone());
+        // The most recently heard-from other side, not an arbitrary one:
+        // with three or more entries a HashMap walk would pair a different
+        // peer on each INIT. Freshness is the tie-break that matters —
+        // entries live for PENDING_TTL, far longer than a peer takes to
+        // vanish, so the side that has been in the registry longest is the
+        // one most likely to be gone. Pairing on first sighting handed a live
+        // peer the oldest entry for exactly that reason. Equal timestamps
+        // fall back to index then host, so the choice stays deterministic.
+        let mut candidates: Vec<(&SideKey, &Side)> =
+            sides.iter().filter(|(held, _)| **held != key).collect();
+        candidates.sort_by_key(|(held, side)| {
+            (std::cmp::Reverse(side.seen), held.client_index, held.host)
+        });
+        let partner = candidates.first().map(|(_, held)| (*held).clone());
         let mut inventory: Vec<(u8, SocketAddr, u8)> = sides
             .iter()
             .map(|(key, side)| (key.client_index, side.address, side.port_type))
@@ -368,6 +457,122 @@ impl Pending {
             replaced,
             inventory,
         }
+    }
+
+    /// Record that a CONNECT naming `partner` is being sent to `key` now, and
+    /// say whether it should go out at all.
+    ///
+    /// `true` means send it; `false` means an identical introduction is
+    /// already being delivered or has been acknowledged, so sending again
+    /// would only duplicate what the retry pass already owns. A CONNECT
+    /// naming a *different* address restarts delivery: the partner rebound,
+    /// and the address this side was given is now wrong.
+    ///
+    /// A side this registry does not hold is still sent its CONNECT. The only
+    /// caller that can present one is a direct introduction, and declining to
+    /// deliver because there is no entry to record retries against would drop
+    /// the packet rather than degrade to sending it once.
+    fn arm_connect(
+        &mut self,
+        title: &str,
+        cookie: u32,
+        key: SideKey,
+        partner: SocketAddrV4,
+        now: Instant,
+    ) -> bool {
+        let Some(side) = self
+            .sides
+            .get_mut(&(title.to_ascii_lowercase(), cookie))
+            .and_then(|sides| sides.get_mut(&key))
+        else {
+            return true;
+        };
+        if let Some(connect) = &side.connect
+            && connect.partner == partner
+        {
+            return false;
+        }
+        side.connect = Some(Connect {
+            partner,
+            attempts: 1,
+            last_sent: now,
+            acknowledged: false,
+        });
+        true
+    }
+
+    /// Every CONNECT whose resend is due, counted as sent.
+    ///
+    /// Claiming the attempt under the same lock that reads it is what lets
+    /// every socket thread run this pass against one registry: the first to
+    /// take a due CONNECT leaves nothing for the others to duplicate.
+    fn due_connects(&mut self, now: Instant) -> Vec<DueConnect> {
+        let mut due = Vec::new();
+        for ((title, cookie), sides) in self.sides.iter_mut() {
+            for (key, side) in sides.iter_mut() {
+                let target = side.address;
+                let socket = side.socket;
+                let Some(connect) = &mut side.connect else {
+                    continue;
+                };
+                if connect.acknowledged
+                    || connect.attempts >= CONNECT_ATTEMPTS
+                    || now.duration_since(connect.last_sent) < CONNECT_RETRY
+                {
+                    continue;
+                }
+                connect.attempts += 1;
+                connect.last_sent = now;
+                due.push(DueConnect {
+                    title: title.clone(),
+                    cookie: *cookie,
+                    client_index: key.client_index,
+                    socket,
+                    target,
+                    partner: connect.partner,
+                    attempt: connect.attempts,
+                    final_attempt: connect.attempts >= CONNECT_ATTEMPTS,
+                });
+            }
+        }
+        due
+    }
+
+    /// Stop resending the CONNECT `from` has just acknowledged.
+    ///
+    /// Matched on cookie and source address: the acknowledgement carries the
+    /// cookie, and it arrives from the mapping the CONNECT was sent to. Every
+    /// cookie space is searched because a CONNECT_ACK carries no title — it
+    /// has no body this project has read, let alone a name field — so the
+    /// registry is what resolves which negotiation it belongs to.
+    fn acknowledge_connect(&mut self, cookie: u32, from: SocketAddr, now: Instant) -> Vec<Acked> {
+        let mut acked = Vec::new();
+        for ((title, held), sides) in self.sides.iter_mut() {
+            if *held != cookie {
+                continue;
+            }
+            for (key, side) in sides.iter_mut() {
+                if side.address != from {
+                    continue;
+                }
+                // The peer is demonstrably still here, so this is the side's
+                // most recent sighting as much as an INIT would be.
+                side.seen = now;
+                let Some(connect) = &mut side.connect else {
+                    continue;
+                };
+                let already = connect.acknowledged;
+                connect.acknowledged = true;
+                acked.push(Acked {
+                    title: title.clone(),
+                    client_index: key.client_index,
+                    attempts: connect.attempts,
+                    partner: connect.partner,
+                    repeated: already,
+                });
+            }
+        }
+        acked
     }
 
     fn sweep(&mut self, now: Instant) -> Vec<u32> {
@@ -416,6 +621,7 @@ pub fn spawn_multi_with_socket(
     if names.is_empty() {
         return Err("NAT needs at least one title".into());
     }
+    crate::distinct_titles("natneg", names.iter().map(String::as_str))?;
     spawn_routes(socket, observer, Some(names))
 }
 /// Serve several NAT sockets from **one** cookie registry.
@@ -455,6 +661,7 @@ pub fn spawn_multi_with_sockets(
     if names.is_empty() {
         return Err("NAT needs at least one title".into());
     }
+    crate::distinct_titles("natneg", names.iter().map(String::as_str))?;
     spawn_shared(sockets, observer, Some(names))
 }
 
@@ -504,14 +711,25 @@ fn prepare<O: Observer>(
     observer.event(
         "natneg",
         &format!(
-            "capability trace: serves init (type {}) only; sends connect (type {}) with \
-             zeroed flag bytes, carrying a peer's private address when both peers share a \
-             public address and its highest-port-type public mapping otherwise. Does not \
-             send init_ack and performs no endpoint resolution test. Serves {} of the three \
-             ports the SDK probes ({}). Pairs on cookie, client index and host; title \
-             routing {}.",
+            "capability trace: acknowledges every accepted init (type {}) with an init_ack \
+             (type {}) echoing its body, which is what ends the peer's init retry loop; \
+             sends connect (type {}) with zeroed flag bytes, carrying a peer's private \
+             address when both peers share a public address and its game-port (NN_PT_GP) \
+             public mapping otherwise, resent every {} ms up to {} times until the peer's \
+             connect_ack (type {}) arrives; acknowledges every report (type {}) with a \
+             report_ack (type {}), which is what lets a peer tell its game the negotiation \
+             finished. Performs no endpoint resolution test and does \
+             not serve preinit. Serves {} of the three ports the SDK probes ({}). Pairs on \
+             cookie, client index and host, preferring the most recently heard-from side; \
+             title routing {}.",
             natneg::packet_type::INIT,
+            natneg::packet_type::INIT_ACK,
             natneg::packet_type::CONNECT,
+            CONNECT_RETRY.as_millis(),
+            CONNECT_ATTEMPTS,
+            natneg::packet_type::CONNECT_ACK,
+            natneg::packet_type::REPORT,
+            natneg::packet_type::REPORT_ACK,
             binds.len(),
             binds
                 .iter()
@@ -608,6 +826,10 @@ fn serve<O: Observer>(shared: &Shared<O>, index: usize, stop: &StopSignal) {
             }
             last_sweep = now;
         }
+        // Every iteration, not every sweep: the receive timeout below bounds
+        // this at roughly 100 ms, which is the granularity a CONNECT retry
+        // interval of half a second needs.
+        retry_connects(shared, now);
         let (length, peer) = match socket.recv_from(&mut buffer) {
             Ok(received) => received,
             Err(error)
@@ -640,63 +862,76 @@ fn serve<O: Observer>(shared: &Shared<O>, index: usize, stop: &StopSignal) {
                 ),
             );
         }
-        let title = if let Some(names) = names {
-            // Every refusal below drops the datagram. Each one is recorded
-            // with the check that refused it and the bytes it refused,
-            // because a silently dropped INIT is indistinguishable from a
-            // peer that never sent one — and these checks are strict enough
-            // (version exactly 4, an ASCII-alphanumeric name, nothing after
-            // its NUL) that a real title can fail them for every packet.
-            let named = match natneg::parse_named_init_detailed(datagram) {
-                Ok(named) => named,
-                Err(refusal) => {
-                    observer.peer_event(
-                        "natneg",
-                        peer,
-                        &format!("drop trace: not a routable named init: {refusal}"),
-                    );
-                    observer.bytes(
-                        "natneg",
-                        peer,
-                        "unroutable named init",
-                        datagram,
-                        MAX_LOGGED_BYTES,
-                    );
-                    continue;
-                }
-            };
-            let (_, name) = named;
-            let mut matching = names.iter().filter(|n| n.eq_ignore_ascii_case(name));
-            let Some(selected) = matching.next() else {
-                observer.peer_event(
-                    "natneg",
-                    peer,
-                    &format!(
-                        "drop trace: init names title {name:?}, which this listener does not serve \
-                         (serving {})",
-                        names.join(", ")
-                    ),
-                );
-                continue;
-            };
-            if matching.next().is_some() {
-                observer.peer_event(
-                    "natneg",
-                    peer,
-                    &format!(
-                        "drop trace: init names title {name:?}, which matches more than one \
-                         configured name; refusing rather than guessing a cookie space"
-                    ),
-                );
-                continue;
-            }
-            selected.as_str()
-        } else {
-            ""
-        };
         match natneg::parse(datagram) {
             Ok(Packet::Init(init)) => {
                 let now = Instant::now();
+                // Title routing applies to INIT alone, because INIT is the
+                // only type that carries a name. It runs here, after the
+                // type dispatch, so that a CONNECT_ACK is not refused for
+                // lacking a field its layout never had.
+                let title = if let Some(names) = names {
+                    // Every refusal below drops the datagram, unacknowledged
+                    // — an INIT this listener will not serve must not be told
+                    // its retry loop is over. Each one is recorded with the
+                    // check that refused it and the bytes it refused, because
+                    // a silently dropped INIT is indistinguishable from a
+                    // peer that never sent one, and these checks are strict
+                    // enough (an ASCII-alphanumeric name, nothing after its
+                    // NUL) that a real title can fail them for every packet.
+                    let named = match natneg::parse_named_init_detailed(datagram) {
+                        Ok(named) => named,
+                        Err(refusal) => {
+                            observer.peer_event(
+                                "natneg",
+                                peer,
+                                &format!("drop trace: not a routable named init: {refusal}"),
+                            );
+                            observer.bytes(
+                                "natneg",
+                                peer,
+                                "unroutable named init",
+                                datagram,
+                                MAX_LOGGED_BYTES,
+                            );
+                            continue;
+                        }
+                    };
+                    let (_, name) = named;
+                    let mut matching = names.iter().filter(|n| n.eq_ignore_ascii_case(name));
+                    let Some(selected) = matching.next() else {
+                        observer.peer_event(
+                            "natneg",
+                            peer,
+                            &format!(
+                                "drop trace: init names title {name:?}, which this listener does \
+                                 not serve (serving {})",
+                                names.join(", ")
+                            ),
+                        );
+                        continue;
+                    };
+                    if matching.next().is_some() {
+                        observer.peer_event(
+                            "natneg",
+                            peer,
+                            &format!(
+                                "drop trace: init names title {name:?}, which matches more than \
+                                 one configured name; refusing rather than guessing a cookie space"
+                            ),
+                        );
+                        continue;
+                    }
+                    selected.as_str()
+                } else {
+                    ""
+                };
+                // Acknowledge before pairing, and before anything that can
+                // fail. This is what ends the peer's INIT retry loop, and it
+                // is owed per port type whether or not a partner is here
+                // yet: an unacknowledged peer abandons the negotiation on its
+                // own retry budget, long before this registry would expire
+                // its entry.
+                acknowledge_init(shared, index, peer, datagram, init.cookie, init.port_type);
                 let side = Side {
                     address: peer,
                     client_index: init.client_index,
@@ -708,6 +943,7 @@ fn serve<O: Observer>(shared: &Shared<O>, index: usize, stop: &StopSignal) {
                     local_address: init.local_address,
                     first_seen: now,
                     inits: 1,
+                    connect: None,
                 };
                 let recorded = shared
                     .pending()
@@ -782,9 +1018,10 @@ fn serve<O: Observer>(shared: &Shared<O>, index: usize, stop: &StopSignal) {
                         "natneg",
                         peer,
                         &format!(
-                            "waiting for the other side of {:#010x}; this listener holds a \
-                             half-finished negotiation for up to {} s and sends no init_ack, \
-                             so a peer may give up on its own retry budget first",
+                            "waiting for the other side of {:#010x}; this init is \
+                             acknowledged, so the peer leaves its retry loop and waits, \
+                             and this listener holds the half-finished negotiation for up \
+                             to {} s from its last packet",
                             init.cookie,
                             PENDING_TTL.as_secs(),
                         ),
@@ -792,8 +1029,93 @@ fn serve<O: Observer>(shared: &Shared<O>, index: usize, stop: &StopSignal) {
                 }
 
                 if let Some(partner) = &recorded.partner {
-                    introduce(shared, init.cookie, &recorded.current, partner);
+                    introduce(shared, title, init.cookie, &recorded.current, partner);
                 }
+            }
+            Ok(Packet::ConnectAck { cookie }) => {
+                // The only thing that stops this service resending a CONNECT.
+                let acked = shared
+                    .pending()
+                    .acknowledge_connect(cookie, peer, Instant::now());
+                if acked.is_empty() {
+                    observer.peer_event(
+                        "natneg",
+                        peer,
+                        &format!(
+                            "connect_ack trace: {cookie:#010x} acknowledges a connect this \
+                             listener is not delivering to {peer}; nothing to stop (an \
+                             expired negotiation, or a cookie this service never paired)"
+                        ),
+                    );
+                }
+                for ack in acked {
+                    observer.peer_event(
+                        "natneg",
+                        peer,
+                        &format!(
+                            "connect_ack trace: {cookie:#010x} title={:?} index {} \
+                             acknowledged the connect naming {} after {} attempt(s){}",
+                            ack.title,
+                            ack.client_index,
+                            ack.partner,
+                            ack.attempts,
+                            if ack.repeated {
+                                "; already acknowledged, so this one changed nothing"
+                            } else {
+                                ""
+                            },
+                        ),
+                    );
+                }
+            }
+            Ok(Packet::Report(report)) => {
+                // Answered before anything else, and whatever the registry
+                // knows about the cookie: the peer is sitting in
+                // `ns_reportsent` and will not tell its game the negotiation
+                // finished until this arrives or it has resent five times
+                // over five seconds. A report for a cookie this service never
+                // paired is still a peer waiting to be released.
+                acknowledge_report(shared, index, peer, datagram, &report);
+                // The one packet that says whether an introduction worked.
+                // Everything else here is what this service did; this is what
+                // the peer made of it.
+                observer.peer_event(
+                    "natneg",
+                    peer,
+                    &format!(
+                        "report trace: cookie={:#010x} index={} result={} game_name={} \
+                         nat_bytes={} (porttype is not reported: the SDK leaves that byte \
+                         unassigned)",
+                        report.cookie,
+                        report.client_index,
+                        if report.success { "success" } else { "failure" },
+                        match &report.game_name {
+                            Some(name) => format!("{name:?}"),
+                            None => "absent".into(),
+                        },
+                        match report.nat_bytes {
+                            Some(bytes) => crate::observe::hex(&bytes),
+                            None => "absent".into(),
+                        },
+                    ),
+                );
+            }
+            Ok(Packet::Unacted {
+                packet_type,
+                cookie,
+            }) => {
+                // Protocol traffic, not a malformed datagram: recognised and
+                // named rather than dumped as bytes.
+                observer.peer_event(
+                    "natneg",
+                    peer,
+                    &format!(
+                        "recognised trace: type {packet_type:#04x} for {cookie:#010x} is a \
+                         negotiation packet this service does not act on (a connect_ping \
+                         belongs between the peers; an init_ack, connect or report_ack \
+                         reaching a server is its own reply reflected back)"
+                    ),
+                );
             }
             Err(error) => {
                 // The application decides whether to retain bounded diagnostics.
@@ -810,8 +1132,181 @@ fn serve<O: Observer>(shared: &Shared<O>, index: usize, stop: &StopSignal) {
     }
 }
 
+/// Acknowledge an accepted INIT, which is what ends the peer's retry loop.
+///
+/// Sent from the socket the INIT arrived on and to the address it came from,
+/// for the same reason a CONNECT is: to the peer's NAT a reply from another
+/// port is a different mapping and would be dropped. One INIT, one
+/// acknowledgement — resends included, since a resend means the peer did not
+/// receive the last one.
+fn acknowledge_init<O: Observer>(
+    shared: &Shared<O>,
+    socket: usize,
+    peer: SocketAddr,
+    datagram: &[u8],
+    cookie: u32,
+    port_type: u8,
+) {
+    let observer = &shared.observer;
+    if port_type > natneg::port_type::NEGOTIATION_3 {
+        // Acknowledged anyway — refusing would be this service inventing a
+        // rule — but the client discards an acknowledgement naming a type
+        // above NN_PT_NN3, so this peer will resend until its budget runs
+        // out and the capture has to say why.
+        observer.peer_event(
+            "natneg",
+            peer,
+            &format!(
+                "anomaly: init for {cookie:#010x} announces port_type {port_type}, above \
+                 NN_PT_NN3 ({}); the client refuses an acknowledgement naming it, so this \
+                 port type cannot be acknowledged and the peer will keep resending it",
+                natneg::port_type::NEGOTIATION_3
+            ),
+        );
+    }
+    let Some(packet) = natneg::init_ack(datagram) else {
+        // Unreachable for a parsed INIT, which is at least a header long.
+        observer.peer_event(
+            "natneg",
+            peer,
+            "init could not be acknowledged: shorter than a header",
+        );
+        return;
+    };
+    match shared.sockets[socket].send_to(&packet, peer) {
+        Ok(_) => observer.peer_event(
+            "natneg",
+            peer,
+            &format!("init_ack sent for {cookie:#010x}: port_type {port_type}"),
+        ),
+        Err(error) => observer.peer_event(
+            "natneg",
+            peer,
+            &format!(
+                "init_ack could not be sent for {cookie:#010x} port_type {port_type}, \
+                 the peer will resend its init and may exhaust its retry budget: {error}"
+            ),
+        ),
+    }
+}
+
+/// Acknowledge a REPORT, which is what lets the peer finish.
+///
+/// Sent from the socket the report arrived on and to the address it came
+/// from, like every other reply here. The SDK sends its report to the
+/// `natneg1` address alone, whichever ports its INITs went to, so on a
+/// multi-socket deployment this normally leaves from the first socket
+/// regardless of where that negotiation was brokered.
+///
+/// Not conditional on the registry holding the cookie: a peer repeats the
+/// report until it is acknowledged, and by the time one arrives the
+/// negotiation may well have been swept.
+fn acknowledge_report<O: Observer>(
+    shared: &Shared<O>,
+    socket: usize,
+    peer: SocketAddr,
+    datagram: &[u8],
+    report: &natneg::Report,
+) {
+    let observer = &shared.observer;
+    let Some(packet) = natneg::report_ack(datagram) else {
+        // Unreachable for a parsed report, which is at least a header long.
+        observer.peer_event(
+            "natneg",
+            peer,
+            "report could not be acknowledged: shorter than a header",
+        );
+        return;
+    };
+    match shared.sockets[socket].send_to(&packet, peer) {
+        Ok(_) => observer.peer_event(
+            "natneg",
+            peer,
+            &format!("report_ack sent for {:#010x}", report.cookie),
+        ),
+        Err(error) => observer.peer_event(
+            "natneg",
+            peer,
+            &format!(
+                "report_ack could not be sent for {:#010x}; the peer will resend its report \
+                 and will not complete its negotiation until it is acknowledged or its five \
+                 attempts run out: {error}",
+                report.cookie
+            ),
+        ),
+    }
+}
+
+/// Send one CONNECT to one side, from the socket that side's INIT arrived on.
+///
+/// Delivery is retried by [`Pending::due_connects`] until the peer
+/// acknowledges it, so a send failure here is not the end of the attempt.
+fn deliver_connect<O: Observer>(
+    shared: &Shared<O>,
+    socket: usize,
+    target: SocketAddr,
+    cookie: u32,
+    partner: SocketAddrV4,
+    attempt: u32,
+    final_attempt: bool,
+) {
+    let observer = &shared.observer;
+    let packet = natneg::connect(cookie, partner.ip().octets(), partner.port());
+    match shared.sockets[socket].send_to(&packet, target) {
+        Ok(_) => observer.peer_event(
+            "natneg",
+            target,
+            &format!(
+                "connect sent for {cookie:#010x}: partner {partner} (attempt {attempt} of \
+                 {CONNECT_ATTEMPTS}; resent every {} ms until the peer acknowledges it){}",
+                CONNECT_RETRY.as_millis(),
+                if final_attempt {
+                    ", the last this service will send"
+                } else {
+                    ""
+                },
+            ),
+        ),
+        Err(error) => observer.peer_event(
+            "natneg",
+            target,
+            &format!(
+                "connect attempt {attempt} could not be sent for {cookie:#010x}, \
+                 it will be retried: {error}"
+            ),
+        ),
+    }
+}
+
+/// Resend every CONNECT that is due and not yet acknowledged.
+fn retry_connects<O: Observer>(shared: &Shared<O>, now: Instant) {
+    // Claimed under the lock, then sent with it released: an observer
+    // callback runs application code, and holding the registry across it
+    // would stall every other socket behind it.
+    let due = shared.pending().due_connects(now);
+    for connect in due {
+        shared.observer.peer_event(
+            "natneg",
+            connect.target,
+            &format!(
+                "connect unacknowledged for {:#010x} title={:?} index {}: resending",
+                connect.cookie, connect.title, connect.client_index,
+            ),
+        );
+        deliver_connect(
+            shared,
+            connect.socket,
+            connect.target,
+            connect.cookie,
+            connect.partner,
+            connect.attempt,
+            connect.final_attempt,
+        );
+    }
+}
+
 /// Tell each side how to reach the other.
-fn introduce<O: Observer>(shared: &Shared<O>, cookie: u32, one: &Side, two: &Side) {
+fn introduce<O: Observer>(shared: &Shared<O>, title: &str, cookie: u32, one: &Side, two: &Side) {
     let observer = &shared.observer;
     observer.event(
         "natneg",
@@ -865,21 +1360,37 @@ fn introduce<O: Observer>(shared: &Shared<O>, cookie: u32, one: &Side, two: &Sid
                 local(partner.local_address),
             ),
         );
-        let packet = natneg::connect(cookie, address.octets(), port);
+        // Record the delivery before sending it, so the retry pass owns every
+        // CONNECT this service has put on the wire. A pairing that names the
+        // same address as the one already in flight sends nothing: the peer
+        // is being retried on a timer, and an INIT resend arriving in the
+        // meantime must not turn into a second stream of CONNECTs.
+        let named = SocketAddrV4::new(address, port);
+        if !shared
+            .pending()
+            .arm_connect(title, cookie, SideKey::of(target), named, Instant::now())
+        {
+            observer.peer_event(
+                "natneg",
+                target.address,
+                &format!(
+                    "connect for {cookie:#010x} naming {named} is already being delivered \
+                     or acknowledged; not duplicating it"
+                ),
+            );
+            continue;
+        }
         // From the socket this target's own INIT arrived on, not whichever
         // socket happens to be running this pairing.
-        match shared.sockets[target.socket].send_to(&packet, target.address) {
-            Ok(_) => observer.peer_event(
-                "natneg",
-                target.address,
-                &format!("connect sent for {cookie:#010x}: partner {address}:{port}"),
-            ),
-            Err(error) => observer.peer_event(
-                "natneg",
-                target.address,
-                &format!("connect could not be sent, peer will retry its init: {error}"),
-            ),
-        }
+        deliver_connect(
+            shared,
+            target.socket,
+            target.address,
+            cookie,
+            named,
+            1,
+            CONNECT_ATTEMPTS <= 1,
+        );
     }
 }
 

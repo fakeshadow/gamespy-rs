@@ -62,7 +62,69 @@ fn side(last: u8, index: u8) -> Side {
         local_address: None,
         first_seen: now,
         inits: 1,
+        connect: None,
     }
+}
+
+/// The next datagram a peer receives.
+fn recv(peer: &UdpSocket, what: &str) -> Vec<u8> {
+    let mut buffer = [0u8; 256];
+    let (length, _) = peer
+        .recv_from(&mut buffer)
+        .unwrap_or_else(|error| panic!("{what} must arrive: {error}"));
+    buffer[..length].to_vec()
+}
+
+/// The acknowledgement of an init, which must arrive before anything else:
+/// it is the packet that ends the peer's own retry loop, and it is owed
+/// whether or not a partner is there to be introduced.
+fn recv_init_ack(peer: &UdpSocket, init: &[u8]) -> Vec<u8> {
+    let packet = recv(peer, "an init_ack");
+    assert_eq!(
+        packet[7],
+        natneg::packet_type::INIT_ACK,
+        "the first reply to an init is its acknowledgement: {packet:02x?}"
+    );
+    assert_eq!(
+        packet,
+        natneg::init_ack(init).unwrap(),
+        "an init_ack echoes the body of the init it answers"
+    );
+    packet
+}
+
+/// The connect that follows, skipping acknowledgements of a peer's other
+/// port types but refusing anything else ahead of it.
+fn recv_connect(peer: &UdpSocket) -> Vec<u8> {
+    for _ in 0..8 {
+        let packet = recv(peer, "a connect");
+        if packet[7] == natneg::packet_type::CONNECT {
+            return packet;
+        }
+        assert_eq!(
+            packet[7],
+            natneg::packet_type::INIT_ACK,
+            "only acknowledgements may precede a connect: {packet:02x?}"
+        );
+    }
+    panic!("no connect arrived");
+}
+
+/// Nothing more arrives within `patience`.
+fn expect_silence(peer: &UdpSocket, patience: Duration, what: &str) {
+    peer.set_read_timeout(Some(patience)).unwrap();
+    let mut buffer = [0u8; 256];
+    let error = peer
+        .recv_from(&mut buffer)
+        .map(|(length, _)| format!("{:02x?}", &buffer[..length]))
+        .expect_err(what);
+    assert!(
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ),
+        "{error}"
+    );
 }
 
 #[test]
@@ -186,6 +248,7 @@ fn an_ipv4_mapped_partner_is_encoded_as_ipv4() {
     two.address = partner;
     introduce(
         &harness(vec![server], crate::observe::Noop),
+        "",
         123,
         &one,
         &two,
@@ -227,12 +290,14 @@ fn two_peers_are_introduced_to_each_other() {
     other[13] = 1;
     two.send_to(&other, bind).expect("peer two init");
 
-    for (peer, partner) in [(&one, &two), (&two, &one)] {
-        let mut buffer = [0u8; 64];
-        let (length, _) = peer.recv_from(&mut buffer).expect("a connect must arrive");
-        let packet = &buffer[..length];
+    for (peer, partner, sent) in [(&one, &two, &init), (&two, &one, &other)] {
+        // Acknowledged first, then introduced: an init that is never
+        // acknowledged ends the negotiation on the peer's own retry budget
+        // however correct the connect that follows it.
+        recv_init_ack(peer, sent);
+        let packet = recv_connect(peer);
+        let packet = packet.as_slice();
         assert_eq!(packet.len(), natneg::CONNECT_LEN);
-        assert_eq!(packet[7], natneg::packet_type::CONNECT);
         assert_eq!(natneg::cookie_of(packet), Some(cookie));
         let port = u16::from_be_bytes(packet[16..18].try_into().unwrap());
         assert_eq!(
@@ -276,32 +341,35 @@ fn separate_listeners_do_not_share_cookies_and_restart_forgets_them() {
         .unwrap();
     one.send_to(&init(0), addr_a).unwrap();
     two.send_to(&init(1), addr_b).unwrap();
-    let mut buffer = [0; 64];
-    let error = two.recv_from(&mut buffer).unwrap_err();
-    assert!(matches!(
-        error.kind(),
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-    ));
+    // Each listener acknowledges its own peer, which is what keeps that peer
+    // waiting instead of timing out — but neither can introduce anyone,
+    // because the other side announced its cookie to a different registry.
+    recv_init_ack(&two, &init(1));
+    expect_silence(
+        &two,
+        Duration::from_millis(250),
+        "a cookie held by another listener cannot be introduced",
+    );
     // The second listener is live and pairs only its own participants.
     one.send_to(b"malformed", addr_b).unwrap();
     one.send_to(&init(0), addr_b).unwrap();
     two.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    let (length, _) = two.recv_from(&mut buffer).unwrap();
     assert_eq!(
-        &buffer[..length],
-        natneg::connect(123, [127, 0, 0, 1], one.local_addr().unwrap().port()).as_slice()
+        recv_connect(&two),
+        natneg::connect(123, [127, 0, 0, 1], one.local_addr().unwrap().port())
     );
     first.shutdown().unwrap();
     let restarted =
         spawn_with_socket(UdpSocket::bind(addr_a).unwrap(), crate::observe::Noop).unwrap();
     two.send_to(&init(1), addr_a).unwrap();
-    two.set_read_timeout(Some(Duration::from_millis(250)))
-        .unwrap();
-    let error = two.recv_from(&mut buffer).unwrap_err();
-    assert!(matches!(
-        error.kind(),
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-    ));
+    // A restart forgets the cookie, so this peer is acknowledged and then
+    // waits: there is no longer a first side to introduce it to.
+    recv_init_ack(&two, &init(1));
+    expect_silence(
+        &two,
+        Duration::from_millis(250),
+        "a restarted listener has forgotten the cookie",
+    );
     restarted.shutdown().unwrap();
     second.shutdown().unwrap();
 }
@@ -317,6 +385,18 @@ impl Capture {
     }
     fn find(&self, needle: &str) -> Option<String> {
         self.lines().into_iter().find(|line| line.contains(needle))
+    }
+    /// [`Capture::find`], but waiting for a line the listener thread emits
+    /// after the packet that let this thread continue. A test that reads a
+    /// reply and then reads the log is racing the thread that sent it.
+    fn find_soon(&self, needle: &str) -> Option<String> {
+        for _ in 0..200 {
+            if let Some(line) = self.find(needle) {
+                return Some(line);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        None
     }
     fn push(&self, line: String) {
         self.0.lock().unwrap().push(line);
@@ -475,17 +555,18 @@ fn a_negotiation_is_traced_field_by_field() {
         packet
     };
 
-    one.send_to(&init(0, 0, 1), bind).unwrap();
-    two.send_to(&init(1, 3, 1), bind).unwrap();
+    let first = init(0, 0, 1);
+    let second = init(1, 3, 1);
+    one.send_to(&first, bind).unwrap();
+    two.send_to(&second, bind).unwrap();
     // Both peers are on loopback, so they share a public address: the
     // single-NAT case, where the address each must punch is the private one
     // the other announced, not the shared public one.
-    for peer in [&one, &two] {
-        let mut buffer = [0u8; 64];
-        let (length, _) = peer.recv_from(&mut buffer).expect("a connect must arrive");
+    for (peer, sent) in [(&one, &first), (&two, &second)] {
+        recv_init_ack(peer, sent);
         assert_eq!(
-            &buffer[..length],
-            natneg::connect(0x6E8A73CD, [192, 168, 1, 50], 7777).as_slice(),
+            recv_connect(peer),
+            natneg::connect(0x6E8A73CD, [192, 168, 1, 50], 7777),
             "a connect between peers behind one NAT carries the private address"
         );
     }
@@ -545,26 +626,42 @@ fn separate_networks_still_get_the_public_mapping() {
 }
 
 #[test]
-fn the_advertised_mapping_is_the_highest_port_type_not_the_latest_init() {
+fn the_advertised_mapping_is_the_game_port_not_the_latest_init() {
     let mut pending = Pending::default();
-    // The game-port init arrives first, then a negotiation-socket init from a
-    // different public port. Arrival order used to decide what a connect
-    // carried; the choice is now deliberate.
-    let mut game = side(220, 0);
-    game.port_type = 3;
-    game.address = SocketAddr::from(([10, 0, 0, 220], 40003));
-    pending.record(0x1234, game);
-
+    // A negotiation probe arrives first, then the game port from a different
+    // public port — the peer's NAT maps its sockets separately. Arrival order
+    // used to decide what a connect carried.
     let mut negotiation = side(220, 0);
-    negotiation.port_type = 0;
-    negotiation.address = SocketAddr::from(([10, 0, 0, 220], 7777));
-    let recorded = pending.record_scoped("", 0x1234, negotiation);
+    negotiation.port_type = natneg::port_type::NEGOTIATION_3;
+    negotiation.address = SocketAddr::from(([10, 0, 0, 220], 40003));
+    pending.record(0x1234, negotiation);
+
+    let mut game = side(220, 0);
+    game.port_type = natneg::port_type::GAME;
+    game.address = SocketAddr::from(([10, 0, 0, 220], 7777));
+    let recorded = pending.record_scoped("", 0x1234, game);
 
     assert_eq!(recorded.current.mappings.len(), 2, "both are kept");
     assert_eq!(
         advertised_mapping(&recorded.current),
-        SocketAddr::from(([10, 0, 0, 220], 40003)),
-        "the highest port type wins, not the most recent init"
+        SocketAddr::from(([10, 0, 0, 220], 7777)),
+        "NN_PT_GP is port type 0, so the lowest type is the game port"
+    );
+
+    // And the other way round, so arrival order is demonstrably not what
+    // decides it.
+    let mut pending = Pending::default();
+    let mut game = side(221, 0);
+    game.port_type = natneg::port_type::GAME;
+    game.address = SocketAddr::from(([10, 0, 0, 221], 7777));
+    pending.record(0x1234, game);
+    let mut negotiation = side(221, 0);
+    negotiation.port_type = natneg::port_type::NEGOTIATION_1;
+    negotiation.address = SocketAddr::from(([10, 0, 0, 221], 40001));
+    let recorded = pending.record_scoped("", 0x1234, negotiation);
+    assert_eq!(
+        advertised_mapping(&recorded.current),
+        SocketAddr::from(([10, 0, 0, 221], 7777))
     );
 }
 
@@ -657,6 +754,7 @@ fn a_connect_leaves_from_the_socket_its_target_used() {
 
     introduce(
         &harness(vec![first, second], crate::observe::Noop),
+        "",
         7,
         &one,
         &two,
@@ -768,4 +866,455 @@ fn side_sharing_host(with: &Side, index: u8) -> Side {
     let mut other = side(0, index);
     other.address = SocketAddr::new(with.address.ip(), 50000);
     other
+}
+
+/// A header-only control packet, which is all a connect_ack is.
+fn control(packet_type: u8, cookie: u32) -> Vec<u8> {
+    let mut packet = natneg::MAGIC.to_vec();
+    packet.push(natneg::VERSION);
+    packet.push(packet_type);
+    packet.extend_from_slice(&cookie.to_be_bytes());
+    packet
+}
+
+/// An init for a listener that routes titles.
+fn named_init(cookie: u32, index: u8, title: &str) -> Vec<u8> {
+    let mut packet = natneg::MAGIC.to_vec();
+    packet.extend_from_slice(&[natneg::VERSION, natneg::packet_type::INIT]);
+    packet.extend_from_slice(&cookie.to_be_bytes());
+    packet.extend_from_slice(&[0, index, 1]);
+    packet.extend_from_slice(&[192, 168, 1, 50 + index]);
+    packet.extend_from_slice(&7777u16.to_be_bytes());
+    packet.extend_from_slice(title.as_bytes());
+    packet.push(0);
+    packet
+}
+
+/// Acknowledging the init is what stops the peer resending it, so it is owed
+/// to a peer whose partner has not arrived — which is every first peer.
+#[test]
+fn a_lone_init_is_acknowledged_before_any_partner_exists() {
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = server.local_addr().unwrap();
+    let capture = Capture::default();
+    let listener = spawn_with_socket(server, capture.clone()).unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // One per port type, each acknowledged on its own: the peer tracks
+    // acknowledgement per port type and resends the ones it has not had back.
+    for port_type in [0u8, 1, 2] {
+        let mut init = named_init(0x0BADF00D, 0, "ignored");
+        init.truncate(21);
+        init[12] = port_type;
+        peer.send_to(&init, bind).unwrap();
+        recv_init_ack(&peer, &init);
+    }
+    expect_silence(
+        &peer,
+        Duration::from_millis(250),
+        "there is nobody to introduce this peer to yet",
+    );
+    drop(listener);
+
+    let waiting = capture.find("waiting for the other side").unwrap();
+    assert!(waiting.contains("this init is acknowledged"), "{waiting}");
+    assert!(
+        capture
+            .find("init_ack sent for 0x0badf00d: port_type 2")
+            .is_some(),
+        "{:#?}",
+        capture.lines()
+    );
+}
+
+/// Acknowledging the init removes what used to prompt a second connect: the
+/// peer stops resending its init. So a lost connect is now this service's to
+/// retry, until the peer's connect_ack says it arrived.
+#[test]
+fn a_connect_is_resent_until_the_peer_acknowledges_it() {
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = server.local_addr().unwrap();
+    let capture = Capture::default();
+    let listener = spawn_with_socket(server, capture.clone()).unwrap();
+    let one = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let two = UdpSocket::bind("127.0.0.1:0").unwrap();
+    for peer in [&one, &two] {
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    }
+    let cookie = 0x6E8A73CDu32;
+    let first = {
+        let mut init = named_init(cookie, 0, "ignored");
+        init.truncate(21);
+        init
+    };
+    let second = {
+        let mut init = named_init(cookie, 1, "ignored");
+        init.truncate(21);
+        init
+    };
+    one.send_to(&first, bind).unwrap();
+    two.send_to(&second, bind).unwrap();
+    recv_init_ack(&one, &first);
+    recv_init_ack(&two, &second);
+
+    let connect = recv_connect(&one);
+    assert_eq!(
+        recv_connect(&one),
+        connect,
+        "an unacknowledged connect is sent again, unchanged"
+    );
+
+    one.send_to(&control(natneg::packet_type::CONNECT_ACK, cookie), bind)
+        .unwrap();
+    // A resend already on the wire may still arrive; what must stop is the
+    // stream of them. A quiet window longer than the retry interval is the
+    // observable form of "stopped".
+    let deadline = Instant::now() + Duration::from_secs(3);
+    one.set_read_timeout(Some(CONNECT_RETRY * 3)).unwrap();
+    let mut buffer = [0u8; 256];
+    while one.recv_from(&mut buffer).is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "connects kept being resent after the acknowledgement"
+        );
+    }
+    drop(listener);
+
+    let lines = capture.lines();
+    let resend = capture
+        .find("connect unacknowledged")
+        .unwrap_or_else(|| panic!("no resend recorded in {lines:#?}"));
+    assert!(resend.contains("resending"), "{resend}");
+    let acked = capture
+        .find("connect_ack trace:")
+        .unwrap_or_else(|| panic!("no acknowledgement recorded in {lines:#?}"));
+    assert!(acked.contains("acknowledged the connect naming"), "{acked}");
+    assert!(
+        capture.find("attempt 2 of").is_some(),
+        "the attempt count is on the record: {lines:#?}"
+    );
+}
+
+/// A connect_ack carries a cookie and no name, so title routing cannot be
+/// applied to it: resolving it against the registry is the only way, and
+/// refusing it for lacking a name field would make every retry unstoppable
+/// on a title-routing listener.
+#[test]
+fn a_connect_ack_is_honoured_on_a_title_routing_listener() {
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = server.local_addr().unwrap();
+    let capture = Capture::default();
+    let listener =
+        spawn_multi_with_socket(server, capture.clone(), vec!["SyntheticTitle".into()]).unwrap();
+    let one = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let two = UdpSocket::bind("127.0.0.1:0").unwrap();
+    for peer in [&one, &two] {
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    }
+    let cookie = 0x11223344u32;
+    let first = named_init(cookie, 0, "SyntheticTitle");
+    let second = named_init(cookie, 1, "SyntheticTitle");
+    one.send_to(&first, bind).unwrap();
+    two.send_to(&second, bind).unwrap();
+    recv_init_ack(&one, &first);
+    recv_init_ack(&two, &second);
+    recv_connect(&one);
+
+    one.send_to(&control(natneg::packet_type::CONNECT_ACK, cookie), bind)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    one.set_read_timeout(Some(CONNECT_RETRY * 3)).unwrap();
+    let mut buffer = [0u8; 256];
+    while one.recv_from(&mut buffer).is_ok() {
+        assert!(Instant::now() < deadline, "resends continued");
+    }
+    drop(listener);
+
+    let lines = capture.lines();
+    let acked = capture
+        .find("connect_ack trace:")
+        .unwrap_or_else(|| panic!("no acknowledgement recorded in {lines:#?}"));
+    assert!(
+        // The cookie space, as the registry keys it: titles are matched
+        // case-insensitively, so the key is the folded name.
+        acked.contains("title=\"synthetictitle\""),
+        "the cookie space is resolved from the registry: {acked}"
+    );
+}
+
+/// An acknowledgement for a negotiation this listener is not delivering is
+/// said to be exactly that, rather than silently discarded.
+#[test]
+fn an_unmatched_connect_ack_is_reported() {
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = server.local_addr().unwrap();
+    let capture = Capture::default();
+    let listener = spawn_with_socket(server, capture.clone()).unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.send_to(&control(natneg::packet_type::CONNECT_ACK, 0xDEADBEEF), bind)
+        .unwrap();
+    expect_silence(
+        &peer,
+        Duration::from_millis(250),
+        "an acknowledgement is not answered",
+    );
+    drop(listener);
+    let lines = capture.lines();
+    let trace = capture
+        .find("connect_ack trace:")
+        .unwrap_or_else(|| panic!("nothing recorded in {lines:#?}"));
+    assert!(trace.contains("nothing to stop"), "{trace}");
+}
+
+/// Types the protocol defines but this service acts on none of are recognised
+/// as protocol traffic. Reporting them as malformed put a byte dump in the
+/// capture for every normal negotiation.
+#[test]
+fn defined_types_this_service_does_not_serve_are_not_called_malformed() {
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = server.local_addr().unwrap();
+    let capture = Capture::default();
+    let listener = spawn_with_socket(server, capture.clone()).unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    for packet_type in [
+        natneg::packet_type::INIT_ACK,
+        natneg::packet_type::CONNECT,
+        natneg::packet_type::CONNECT_PING,
+        natneg::packet_type::PREINIT_ACK,
+    ] {
+        peer.send_to(&control(packet_type, 0x5A5A5A5A), bind)
+            .unwrap();
+    }
+    // An undefined type is still malformed, and still dumped.
+    peer.send_to(&control(0x42, 0x5A5A5A5A), bind).unwrap();
+    expect_silence(
+        &peer,
+        Duration::from_millis(250),
+        "none of these are answered",
+    );
+    drop(listener);
+
+    let lines = capture.lines();
+    for expected in ["type 0x01", "type 0x05", "type 0x07", "type 0x10"] {
+        let trace = capture
+            .find(&format!("recognised trace: {expected}"))
+            .unwrap_or_else(|| panic!("{expected} not recognised in {lines:#?}"));
+        assert!(trace.contains("does not act on"), "{trace}");
+    }
+    assert!(
+        capture
+            .find("not served: unhandled negotiation packet type 0x42")
+            .is_some(),
+        "{lines:#?}"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.contains("unserved datagram"))
+            .count(),
+        1,
+        "only the undefined type is dumped as bytes: {lines:#?}"
+    );
+}
+
+/// Entries outlive the peers that made them, so the side heard from most
+/// recently is the one still likely to be there. Pairing on first sighting
+/// handed a live peer the oldest entry, which is the likeliest corpse.
+#[test]
+fn the_freshest_side_is_the_partner() {
+    let mut pending = Pending::default();
+    let stale = side(220, 0);
+    let mut fresher = side(221, 1);
+    fresher.seen = stale.seen + Duration::from_secs(20);
+    pending.record(0x1234, stale.clone());
+    pending.record(0x1234, fresher.clone());
+
+    let mut arriving = side(222, 2);
+    arriving.seen = fresher.seen + Duration::from_secs(1);
+    let partner = pending
+        .record(0x1234, arriving)
+        .expect("two sides are already waiting");
+    assert_eq!(
+        partner.address, fresher.address,
+        "the side heard from most recently is the partner"
+    );
+}
+
+/// Delivery of one connect is owned by the retry pass. An init resend
+/// arriving mid-delivery must not start a second stream of them.
+#[test]
+fn an_identical_introduction_is_not_delivered_twice() {
+    let mut pending = Pending::default();
+    let side = side(220, 0);
+    let key = SideKey::of(&side);
+    pending.record(0x1234, side.clone());
+    let partner = SocketAddrV4::new([192, 168, 1, 50].into(), 7777);
+    let now = Instant::now();
+    assert!(pending.arm_connect("", 0x1234, key, partner, now));
+    assert!(
+        !pending.arm_connect("", 0x1234, key, partner, now),
+        "the same introduction is already being delivered"
+    );
+
+    // A partner that rebound is a different introduction: the address this
+    // side was given is now wrong, so delivery restarts.
+    let moved = SocketAddrV4::new([192, 168, 1, 50].into(), 7778);
+    assert!(pending.arm_connect("", 0x1234, key, moved, now));
+
+    // Acknowledged, and so not armed again by a later resend.
+    assert_eq!(
+        pending.acknowledge_connect(0x1234, side.address, now).len(),
+        1
+    );
+    assert!(!pending.arm_connect("", 0x1234, key, moved, now));
+    assert!(
+        pending.due_connects(now + CONNECT_RETRY * 4).is_empty(),
+        "an acknowledged connect is never due again"
+    );
+}
+
+/// Resends are bounded: a peer that has gone away must not hold a socket
+/// resending into nothing.
+#[test]
+fn connect_resends_are_bounded_and_claimed_once() {
+    let mut pending = Pending::default();
+    let side = side(220, 0);
+    let key = SideKey::of(&side);
+    pending.record(0x1234, side.clone());
+    let partner = SocketAddrV4::new([192, 168, 1, 50].into(), 7777);
+    let start = Instant::now();
+    assert!(pending.arm_connect("", 0x1234, key, partner, start));
+
+    let mut sent = 1;
+    let mut at = start;
+    for _ in 0..CONNECT_ATTEMPTS + 4 {
+        at += CONNECT_RETRY;
+        let due = pending.due_connects(at);
+        // Claimed under the lock, so a second pass at the same instant finds
+        // nothing: every socket thread runs this against one registry.
+        assert!(pending.due_connects(at).is_empty(), "claimed twice");
+        sent += due.len() as u32;
+    }
+    assert_eq!(sent, CONNECT_ATTEMPTS, "resends stop at the budget");
+    let last = pending
+        .sides
+        .values()
+        .flat_map(|sides| sides.values())
+        .next()
+        .and_then(|side| side.connect.clone())
+        .unwrap();
+    assert_eq!(last.attempts, CONNECT_ATTEMPTS);
+    assert!(!last.acknowledged);
+}
+
+/// The client refuses an acknowledgement whose port type is above
+/// `NN_PT_NN3`, so such an init cannot be acknowledged usefully however this
+/// service replies. It is still answered — refusing would be inventing a
+/// rule — and the capture says why that peer keeps resending.
+#[test]
+fn an_init_above_the_last_port_type_is_answered_and_reported() {
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = server.local_addr().unwrap();
+    let capture = Capture::default();
+    let listener = spawn_with_socket(server, capture.clone()).unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let mut init = named_init(0x33445566, 0, "ignored");
+    init.truncate(21);
+    init[12] = natneg::port_type::NEGOTIATION_3 + 1;
+    peer.send_to(&init, bind).unwrap();
+    recv_init_ack(&peer, &init);
+    drop(listener);
+
+    let lines = capture.lines();
+    let anomaly = capture
+        .find("above NN_PT_NN3")
+        .unwrap_or_else(|| panic!("the port type is not reported in {lines:#?}"));
+    assert!(anomaly.contains("port_type 4"), "{anomaly}");
+    assert!(anomaly.contains("keep resending"), "{anomaly}");
+}
+
+/// A peer sits in `ns_reportsent` and will not tell its game the negotiation
+/// finished until its report is acknowledged — or until five resends over
+/// five seconds have run out. So the acknowledgement has to be on the wire,
+/// and it has to be on the wire for a cookie this listener never paired,
+/// because a report can outlive the negotiation it describes.
+#[test]
+fn a_report_is_acknowledged_even_for_a_cookie_that_was_never_paired() {
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = server.local_addr().unwrap();
+    let capture = Capture::default();
+    let listener = spawn_with_socket(server, capture.clone()).unwrap();
+
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let mut report = Vec::new();
+    report.extend_from_slice(&natneg::MAGIC);
+    report.push(natneg::VERSION);
+    report.push(natneg::packet_type::REPORT);
+    report.extend_from_slice(&0x6E8A73CDu32.to_be_bytes());
+    report.push(0xA5); // porttype: never assigned by the SDK
+    report.push(1); // clientindex
+    report.push(1); // negResult: a boolean
+    report.extend_from_slice(&[0; 8]); // natType, natMappingScheme
+    let mut name = [0u8; 50];
+    name[.."SyntheticTitle".len()].copy_from_slice(b"SyntheticTitle");
+    report.extend_from_slice(&name);
+
+    peer.send_to(&report, bind).unwrap();
+    let ack = recv(&peer, "a report_ack");
+    assert_eq!(
+        ack,
+        natneg::report_ack(&report).unwrap(),
+        "a report_ack echoes the report with only the type changed"
+    );
+    assert_eq!(ack[7], natneg::packet_type::REPORT_ACK);
+
+    let trace = capture
+        .find_soon("report trace")
+        .expect("the one packet that says whether an introduction worked is recorded");
+    assert!(trace.contains("result=success"), "{trace}");
+    assert!(trace.contains("index=1"), "{trace}");
+    assert!(trace.contains("SyntheticTitle"), "{trace}");
+    assert!(
+        capture.find("not served").is_none(),
+        "a report is protocol traffic, not a malformed datagram"
+    );
+    drop(listener);
+}
+
+/// A failure report is still a report: it must be acknowledged just the same,
+/// and its result must not be reported as a success.
+#[test]
+fn a_failure_report_is_acknowledged_and_recorded_as_a_failure() {
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = server.local_addr().unwrap();
+    let capture = Capture::default();
+    let listener = spawn_with_socket(server, capture.clone()).unwrap();
+
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Short, and with no game name: a peer repeating a report this listener
+    // cannot fully read is still a peer waiting to be released.
+    let mut report = Vec::new();
+    report.extend_from_slice(&natneg::MAGIC);
+    report.push(natneg::VERSION);
+    report.push(natneg::packet_type::REPORT);
+    report.extend_from_slice(&1u32.to_be_bytes());
+    report.extend_from_slice(&[0, 2, 0]);
+
+    peer.send_to(&report, bind).unwrap();
+    assert_eq!(
+        recv(&peer, "a report_ack")[7],
+        natneg::packet_type::REPORT_ACK
+    );
+
+    let trace = capture.find_soon("report trace").expect("recorded");
+    assert!(trace.contains("result=failure"), "{trace}");
+    assert!(trace.contains("game_name=absent"), "{trace}");
+    drop(listener);
 }

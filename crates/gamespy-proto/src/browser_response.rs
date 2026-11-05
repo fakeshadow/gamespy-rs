@@ -6,6 +6,26 @@ use crate::browser_crypt::{self, Cipher, KEY_LEN};
 /// client's `+2` arithmetic allows.
 pub const BLOCK1_LEN: usize = 2;
 
+/// What those two bytes **are**: the backend game flags.
+///
+/// Not padding and not the server's free choice. The client reads them out of
+/// the crypt header and keeps them (`+0x9d4`), and the referenced SDK's
+/// `sb_internal.h` defines their bits there — `QR2_USE_QUERY_CHALLENGE 128`,
+/// commented *"backend query flags (set in hbmaster, don't change)"* — which
+/// change how the client queries **game hosts**, not this service.
+///
+/// Sending random bytes here therefore sets flags at random: a client would
+/// take roughly half of all replies as an instruction to use query challenges
+/// against hosts. Zero is the value that asks for nothing, and the only one
+/// this project has evidence for.
+pub const NO_BACKEND_GAME_FLAGS: [u8; BLOCK1_LEN] = [0, 0];
+
+/// `QR2_USE_QUERY_CHALLENGE`, the one backend game flag the SDK names.
+///
+/// Set it in `block1`'s first byte only if the deployment means it; this
+/// crate never sets it.
+pub const QR2_USE_QUERY_CHALLENGE: u8 = 128;
+
 /// The port value that diverts the client to a message string instead of a
 /// server list (`0x00aebfc4`).
 pub const MESSAGE_STRING_PORT: u16 = 0xFFFF;
@@ -161,11 +181,11 @@ pub fn message_payload(peer_ip: [u8; 4], message: &str) -> Option<Vec<u8>> {
 /// Wrap a payload in the header the client's decoder expects and encrypt it
 /// with the key derived from `challenge` and the title secret.
 ///
-/// `block1` and `block2` are the two header blocks, and their contents are the
-/// server's choice: the client uses `block2` only to derive the key and keeps
-/// two bytes of `block1` at `+0x9d4`. Random is the sensible choice. Returns
-/// `None` for an empty secret, or a `block2` longer than a length byte can
-/// describe.
+/// `block2` is the key salt and nothing else: the client uses it only to
+/// derive the key, so random is the sensible choice there. `block1` is **not**
+/// the server's choice — it is the backend game flags the client keeps and
+/// acts on; see [`NO_BACKEND_GAME_FLAGS`]. Returns `None` for an empty
+/// secret, or a `block2` longer than a length byte can describe.
 pub fn encode(
     challenge: [u8; KEY_LEN],
     secret: &[u8],
