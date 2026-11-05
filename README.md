@@ -15,3 +15,17 @@ The source is distributed under the [MIT License](LICENSE), with the original co
 The public service interfaces are closely tied to the DNS records and service hostnames used by clients. Correct integration requires those names to resolve to the intended service endpoints. DNS configuration remains the caller's responsibility; the libraries do not manage DNS records or client resolver settings.
 
 Before using the public APIs, callers should read the [DNS overrides and service endpoints specification](crates/gamespy-runtime/src/lib.rs) and the relevant API documentation. These describe hostname mappings, transports, ports, endpoint relationships, and caller responsibilities. DNS resolution alone does not configure service ports, HTTP host handling, or TLS requirements.
+
+## NAT negotiation protocol versions
+
+The NAT negotiation service serves protocol versions 3 and 4 on one listener,
+from one codec and one negotiation engine. Which versions a deployment accepts,
+and the server behaviours that are not derived from the version, are configured
+through `gamespy_runtime::natneg::Policy`.
+
+[NAT negotiation: protocol versions 3 and 4](docs/natneg-versions.md) records
+the compatibility matrix, the SDK evidence behind each entry, which differences
+are wire-level and which are server policy, and a migration note for an
+existing version 3 consumer. Serving both versions on one listener is not a
+claim that a version 3 client and a version 4 client can negotiate with each
+other.

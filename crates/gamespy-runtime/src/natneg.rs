@@ -3,13 +3,47 @@
 //! [`spawn_with_socket`] documents SDK endpoint names and ports. The
 //! [`crate::listener::Listener`] it returns manages that same socket's
 //! lifetime; it does not create another endpoint.
+//!
+//! # Protocol versions
+//!
+//! One listener serves negotiation protocol **version 3 and version 4** from
+//! one registry and one negotiation engine. The version byte carries no layout
+//! difference between those generations — the pinned SDK's packet structs are
+//! the same ones this crate already parsed for version 4 — so there is nothing
+//! to fork. What the version does decide is one thing: every reply this
+//! service sends is encoded in the version its **recipient** used.
+//!
+//! Everything else that distinguishes two negotiation servers is server
+//! policy, and is configured through [`Policy`] rather than selected from the
+//! version: which versions are accepted at all, when a side becomes eligible
+//! to be introduced ([`Readiness`]), which of a peer's mappings a CONNECT is
+//! delivered to ([`ControlEndpoint`]), what happens when a source moves
+//! ([`Rebinding`]), the acknowledgement shapes
+//! ([`natneg::InitAckShape`] and [`natneg::ReportAckShape`]), whether a lone
+//! peer is told its partner never arrived ([`Policy::partner_wait`]), and how
+//! much pending state is held ([`Policy::max_negotiations`]).
+//!
+//! Each participant's version is retained for the life of its entry. A
+//! participant whose version changes is refused rather than overwritten, and
+//! two peers that announce one cookie in **different** versions are not
+//! introduced unless [`Policy::pair_across_versions`] says so: serving both
+//! generations on one socket is not evidence that a mixed pair can play
+//! together.
+//!
+//! [`Policy::default()`] is what this crate has always done, so an existing
+//! version 4 embedder's replies do not change shape and no new packet type
+//! appears. [`Policy::v3_compatible()`] reproduces the behaviour of the
+//! mkvsdcu version 3 listener this implementation replaces.
+//!
+//! See `docs/natneg-versions.md` in the repository for the full compatibility
+//! matrix, the SDK evidence behind each claim, and a consumer migration note.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gamespy_proto::natneg::{self, Packet};
+use gamespy_proto::natneg::{self, Packet, Version};
 
 use crate::listener::{Listener, StopSignal};
 use crate::observe::Observer;
@@ -62,11 +96,251 @@ const CONNECT_RETRY: Duration = Duration::from_millis(500);
 /// negotiation is over.
 const CONNECT_ATTEMPTS: u32 = 10;
 
+/// How long a lone side is held before it is told no partner arrived, when
+/// [`Policy::partner_wait`] is set.
+///
+/// Thirty seconds, which is half the SDK's own `PARTNER_WAIT_TIME` of 60 000
+/// ms. Staying under it is the whole point: the peer is already counting, and
+/// a `FINISHED_ERROR_DEADBEAT_PARTNER` that lands first turns a silent
+/// minute-long stall into an immediate, named failure the title can show.
+pub const DEFAULT_PARTNER_WAIT: Duration = Duration::from_secs(30);
+
+/// How many negotiations one registry holds before it refuses new cookies.
+///
+/// A bound rather than none, because every INIT from an unknown cookie would
+/// otherwise allocate an entry that only expiry reclaims, and nothing
+/// in the protocol stops a peer inventing cookies. Refusing a *new* cookie at
+/// the limit never disturbs a negotiation already in progress.
+pub const DEFAULT_MAX_NEGOTIATIONS: usize = 4096;
+
+/// Every version this build can be configured to accept.
+pub const BOTH_VERSIONS: &[Version] = &Version::SUPPORTED;
+/// Accept version 3 alone, refusing version 4 with a reason.
+pub const V3_ONLY: &[Version] = &[Version::V3];
+/// Accept version 4 alone, refusing version 3 with a reason.
+pub const V4_ONLY: &[Version] = &[Version::V4];
+
+/// When a side becomes eligible to be introduced to its partner.
+///
+/// **This is server policy, not a version difference.** A peer sends one INIT
+/// per port type and `ProcessConnectPacket` in the referenced SDK acts on a
+/// CONNECT in any negotiation state, so introducing on the first INIT is
+/// legitimate. Waiting is a different trade, not a newer protocol.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Readiness {
+    /// Introduce as soon as the other side is present, from the first INIT.
+    ///
+    /// What this crate has always done. The introduction goes out sooner, and
+    /// if a later INIT reveals a better mapping the CONNECT is re-armed for
+    /// the new address — so the cost is extra CONNECTs on the wire for a peer
+    /// whose NAT maps each socket separately.
+    #[default]
+    OnFirstInit,
+    /// Wait until the side has announced all three negotiation port types,
+    /// plus the game port when it set `usegameport`.
+    ///
+    /// The mkvsdcu v3 listener's rule, and the SDK's own completion condition
+    /// for leaving `ns_initsent`. The advertised mapping is then known to be
+    /// the real game-port mapping rather than whichever INIT happened to
+    /// arrive first, so exactly one CONNECT is needed per side. The cost is
+    /// that a peer whose INIT for one port type never arrives is never
+    /// introduced, and fails on [`Policy::partner_wait`] or its own timeout.
+    AllRegistrations,
+}
+
+/// Which of a peer's public mappings this service sends a CONNECT to.
+///
+/// The address a partner must *punch* is a separate question, answered by the
+/// lowest port type a side announced; see `advertised_mapping`. This is only
+/// about where the CONNECT itself is delivered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ControlEndpoint {
+    /// The source of the side's most recent INIT.
+    ///
+    /// What this crate has always done. Correct whenever a peer pumps every
+    /// socket it negotiates from, which the SDK's own loop does.
+    #[default]
+    LatestInit,
+    /// The mapping the side announced under `NN_PT_NN1`, falling back to the
+    /// latest INIT if it has not announced one.
+    ///
+    /// The mkvsdcu v3 listener's rule. `NN_PT_NN1` is the first negotiation
+    /// probe, which the SDK sends from `negotiateSock` — the socket its
+    /// negotiation state machine owns — whereas `NN_PT_GP` comes from the
+    /// title's own game socket. Delivering control traffic to the control
+    /// socket is the safer choice where a title does not pump the game socket
+    /// through `NNProcessData`.
+    NegotiationMapping,
+}
+
+/// What this service does when a side announces a port type from an address
+/// other than the one it used before.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Rebinding {
+    /// Take the new address as the side's current mapping, recording the
+    /// change as an anomaly. What this crate has always done.
+    ///
+    /// A NAT really can rebind mid-negotiation, and following it is the only
+    /// way such a peer completes — at the cost that anything able to spoof an
+    /// INIT for a live cookie can move where a CONNECT is delivered.
+    #[default]
+    Follow,
+    /// Refuse the INIT, leaving the first address that announced that port
+    /// type in place, and do not acknowledge it.
+    ///
+    /// The mkvsdcu v3 listener's rule: each of indices 0 and 1 belongs to one host,
+    /// and each port type belongs to one source
+    /// for the whole exchange. A genuine rebinding then fails rather than
+    /// being followed, which is the trade this option makes deliberately.
+    Pin,
+}
+
+/// Deployment policy for a negotiation service: which versions it accepts, and
+/// the behaviours that are **not** derived from the version.
+///
+/// [`Policy::default()`] is what this crate has always done, with both
+/// versions accepted and the two bounds below applied. Everything else is
+/// opt-in, so an existing embedder's replies do not change shape or gain new
+/// packet types by upgrading.
+///
+/// Nothing here is selected from the version byte. The reply *shapes* in
+/// particular are interchangeable between the two generations — see
+/// [`natneg::InitAckShape`] and [`natneg::ReportAckShape`] for the SDK
+/// evidence — so they are configured for the deployment, not inferred.
+#[derive(Clone, Debug)]
+pub struct Policy {
+    /// Titles to serve with separate cookie spaces, with strict named-INIT
+    /// admission. `None` serves one shared cookie space and routes nothing,
+    /// which is [`spawn_with_socket`]'s behaviour.
+    pub titles: Option<Vec<String>>,
+    /// Versions this listener accepts. A packet in any other version is
+    /// refused before state is created, with the byte in the diagnostic.
+    pub versions: &'static [Version],
+    /// Whether two peers that announced different versions for one cookie may
+    /// be introduced to each other.
+    ///
+    /// `false`, and left that way without evidence: one listener serving both
+    /// generations says nothing about whether a version 3 console and a
+    /// version 4 console can play together, which is a question about the
+    /// titles rather than about this service. A refusal is recorded so the
+    /// case is visible if it happens.
+    pub pair_across_versions: bool,
+    pub readiness: Readiness,
+    pub control_endpoint: ControlEndpoint,
+    pub rebinding: Rebinding,
+    pub init_ack: natneg::InitAckShape,
+    pub report_ack: natneg::ReportAckShape,
+    /// How long a lone side is held before it is sent a CONNECT carrying
+    /// `FINISHED_ERROR_DEADBEAT_PARTNER`. `None` sends nothing and lets the
+    /// peer time out on its own, which is what this crate has always done.
+    ///
+    /// Said once per negotiation: a failure CONNECT is never acknowledged by
+    /// the client, so there is nothing to retry towards, and the cookie is
+    /// then closed to late arrivals rather than left half-failed.
+    pub partner_wait: Option<Duration>,
+    /// How many negotiations this registry holds at once; see
+    /// [`DEFAULT_MAX_NEGOTIATIONS`].
+    pub max_negotiations: usize,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            titles: None,
+            versions: BOTH_VERSIONS,
+            pair_across_versions: false,
+            readiness: Readiness::OnFirstInit,
+            control_endpoint: ControlEndpoint::LatestInit,
+            rebinding: Rebinding::Follow,
+            init_ack: natneg::InitAckShape::Echoed,
+            report_ack: natneg::ReportAckShape::Echoed,
+            partner_wait: None,
+            max_negotiations: DEFAULT_MAX_NEGOTIATIONS,
+        }
+    }
+}
+
+impl Policy {
+    /// The behaviour of the mkvsdcu version 3 listener this policy exists to
+    /// replace, so a migrating deployment's wire traffic does not change.
+    ///
+    /// Version 3 alone, [`Readiness::AllRegistrations`],
+    /// [`ControlEndpoint::NegotiationMapping`], [`Rebinding::Pin`], the
+    /// 21-byte acknowledgement shapes, a 30-second partner wait and a
+    /// 1024-negotiation bound. Use [`Policy::accepting`] on top of it to serve
+    /// version 4 alongside, which changes nothing else.
+    pub fn v3_compatible() -> Self {
+        Self {
+            versions: V3_ONLY,
+            readiness: Readiness::AllRegistrations,
+            control_endpoint: ControlEndpoint::NegotiationMapping,
+            rebinding: Rebinding::Pin,
+            init_ack: natneg::InitAckShape::Fields,
+            report_ack: natneg::ReportAckShape::InitBody,
+            partner_wait: Some(DEFAULT_PARTNER_WAIT),
+            max_negotiations: 1024,
+            ..Self::default()
+        }
+    }
+
+    /// Serve these versions and no others.
+    pub fn accepting(mut self, versions: &'static [Version]) -> Self {
+        self.versions = versions;
+        self
+    }
+
+    /// Serve these titles in separate cookie spaces, with strict named-INIT
+    /// admission.
+    pub fn with_titles(mut self, titles: Vec<String>) -> Self {
+        self.titles = Some(titles);
+        self
+    }
+
+    /// Tell a lone side that no partner arrived after `wait`, instead of
+    /// leaving it silent.
+    pub fn with_partner_wait(mut self, wait: Option<Duration>) -> Self {
+        self.partner_wait = wait;
+        self
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.versions.is_empty() {
+            return Err("natneg needs at least one accepted protocol version".into());
+        }
+        if self.max_negotiations == 0 {
+            return Err("natneg needs room for at least one negotiation".into());
+        }
+        if let Some(titles) = &self.titles {
+            if titles.is_empty() {
+                return Err("NAT needs at least one title".into());
+            }
+            crate::distinct_titles("natneg", titles.iter().map(String::as_str))?;
+        }
+        Ok(())
+    }
+
+    /// The versions this policy accepts, for a log line.
+    fn versions_text(&self) -> String {
+        self.versions
+            .iter()
+            .map(Version::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// One side of a negotiation.
 #[derive(Clone, Debug)]
 struct Side {
     address: SocketAddr,
     client_index: u8,
+    /// The protocol version every packet from this side has announced.
+    ///
+    /// Retained per side, not per listener: replies to this peer are encoded
+    /// in it, a change of it is treated as a different client rather than a
+    /// resend, and pairing across a disagreement is refused unless
+    /// [`Policy::pair_across_versions`] says otherwise.
+    version: Version,
     seen: Instant,
     /// Which of the peer's sockets the most recent INIT announced. Not part
     /// of the key this service pairs on.
@@ -116,6 +390,7 @@ struct Connect {
 ///
 /// Returned rather than logged in place so the decision stays testable and
 /// the listener owns all the formatting.
+#[derive(Debug)]
 struct Recorded {
     /// The side as stored, with its resend history carried forward.
     current: Side,
@@ -125,6 +400,93 @@ struct Recorded {
     replaced: Option<Side>,
     /// Every side now held for this cookie: index, public address, port type.
     inventory: Vec<(u8, SocketAddr, u8)>,
+    /// A side present for this cookie that was **not** offered as a partner
+    /// because it announced a different version. Recorded rather than
+    /// silently skipped: from the peers' side this looks exactly like a
+    /// partner that never arrived.
+    version_mismatch: Option<(u8, Version)>,
+}
+
+/// Why an INIT was not recorded, and therefore not acknowledged.
+///
+/// Every refusal here drops the datagram without a reply, which is the same
+/// thing a title-routing refusal does and for the same reason: an INIT this
+/// service will not serve must not be told its retry loop is over.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum InitRefusal {
+    /// The pinned two-client policy only serves indices 0/1 and port types 0..=3.
+    InvalidPinnedFields,
+    /// Another host already owns this index under the pinned policy.
+    ClientHostPinned {
+        client_index: u8,
+        held: IpAddr,
+        announced: IpAddr,
+    },
+    /// The registry is full and this cookie is not one it already holds.
+    Capacity { held: usize, limit: usize },
+    /// A lone side for this cookie has already been told no partner arrived.
+    /// Reviving it would introduce a peer that has given up.
+    Abandoned,
+    /// This side announced a different protocol version from the one it used
+    /// before. Not a resend, and not something to overwrite in place.
+    VersionChanged { held: Version, announced: Version },
+    /// [`Rebinding::Pin`] is in force and this port type was already
+    /// announced from another address.
+    SourcePinned {
+        port_type: u8,
+        held: SocketAddr,
+        announced: SocketAddr,
+    },
+    /// [`Rebinding::Pin`] is in force and this side changed its
+    /// `usegameport` flag, which changes which mapping a partner is told to
+    /// punch.
+    GamePortChanged { held: bool, announced: bool },
+}
+
+impl std::fmt::Display for InitRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPinnedFields => {
+                formatter.write_str("invalid pinned client index or port type")
+            }
+            Self::ClientHostPinned {
+                client_index,
+                held,
+                announced,
+            } => write!(
+                formatter,
+                "client index {client_index} belongs to {held}, not {announced}"
+            ),
+            Self::Capacity { held, limit } => write!(
+                formatter,
+                "this registry holds {held} negotiations, its limit of {limit}; a new cookie \
+                 is refused rather than evicting one in progress"
+            ),
+            Self::Abandoned => formatter.write_str(
+                "this cookie was already told no partner arrived, so it is closed to further \
+                 inits",
+            ),
+            Self::VersionChanged { held, announced } => write!(
+                formatter,
+                "this side announced version {held} and now version {announced}; a version \
+                 change is a different client, not a resend"
+            ),
+            Self::SourcePinned {
+                port_type,
+                held,
+                announced,
+            } => write!(
+                formatter,
+                "port type {port_type} is pinned to {held} and this init came from \
+                 {announced}; the configured rebinding policy refuses to follow it"
+            ),
+            Self::GamePortChanged { held, announced } => write!(
+                formatter,
+                "this side announced usegameport {held} and now {announced}, which changes \
+                 which of its sockets a partner would be told to punch"
+            ),
+        }
+    }
 }
 
 /// Something in a peer's INIT sequence that this service's pairing rule
@@ -152,6 +514,15 @@ enum Anomaly {
         port_type: u8,
         previous: u16,
         current: u16,
+    },
+    /// Two peers announced one cookie in different protocol versions. They
+    /// are not introduced unless the deployment asked for it, because one
+    /// listener serving both generations is not evidence that a mixed pair
+    /// can play together.
+    MixedVersionPair {
+        this_side: (u8, Version),
+        other_side: (u8, Version),
+        paired: bool,
     },
 }
 
@@ -186,6 +557,23 @@ impl std::fmt::Display for Anomaly {
             } => write!(
                 formatter,
                 "peer rebound mid-negotiation on port type {port_type}: {previous} then {current}"
+            ),
+            Self::MixedVersionPair {
+                this_side,
+                other_side,
+                paired,
+            } => write!(
+                formatter,
+                "index {} announced protocol version {} and index {} announced version {}; {}",
+                this_side.0,
+                this_side.1,
+                other_side.0,
+                other_side.1,
+                if *paired {
+                    "this deployment pairs across versions, so they are being introduced"
+                } else {
+                    "they are not introduced, and each waits as if the other had not arrived"
+                },
             ),
         }
     }
@@ -359,11 +747,96 @@ impl SideKey {
     }
 }
 
+/// Whether a side has announced enough of its sockets to be introduced.
+///
+/// See [`Readiness`]; the port types are the SDK's `NN_PT_*`, and the
+/// game-port requirement is conditional on the peer's own `usegameport`
+/// exactly as the SDK's own completion condition is.
+fn is_ready(side: &Side, readiness: Readiness) -> bool {
+    match readiness {
+        Readiness::OnFirstInit => true,
+        Readiness::AllRegistrations => {
+            (natneg::port_type::NEGOTIATION_1..=natneg::port_type::NEGOTIATION_3)
+                .all(|port_type| side.mappings.contains_key(&port_type))
+                && (!side.use_game_port || side.mappings.contains_key(&natneg::port_type::GAME))
+        }
+    }
+}
+
+/// Which registrations a side is still missing, for a log line.
+fn missing_registrations(side: &Side) -> Vec<u8> {
+    let mut missing: Vec<u8> = (natneg::port_type::NEGOTIATION_1
+        ..=natneg::port_type::NEGOTIATION_3)
+        .filter(|port_type| !side.mappings.contains_key(port_type))
+        .collect();
+    if side.use_game_port && !side.mappings.contains_key(&natneg::port_type::GAME) {
+        missing.insert(0, natneg::port_type::GAME);
+    }
+    missing
+}
+
+/// Where a CONNECT for this side is delivered; see [`ControlEndpoint`].
+///
+/// Distinct from `advertised_mapping`, which is the address the *partner* is
+/// told to punch. Conflating the two is what made a CONNECT land on a game
+/// socket a title may never pump.
+fn control_endpoint(side: &Side, endpoint: ControlEndpoint) -> SocketAddr {
+    match endpoint {
+        ControlEndpoint::LatestInit => side.address,
+        ControlEndpoint::NegotiationMapping => side
+            .mappings
+            .get(&natneg::port_type::NEGOTIATION_1)
+            .copied()
+            .unwrap_or(side.address),
+    }
+}
+
+/// One negotiation: the sides announcing a single cookie within one title.
+struct Negotiation {
+    sides: HashMap<SideKey, Side>,
+    /// When this cookie was first seen, which is what [`Policy::partner_wait`]
+    /// is measured from. Not refreshed by resends: the question it answers is
+    /// how long the *negotiation* has been short of a partner.
+    created: Instant,
+    /// Set once a lone side has been told no partner arrived. Nothing more is
+    /// sent for this cookie and a late peer cannot revive it, because the
+    /// peer that was told has already reported the failure to its title.
+    abandoned: bool,
+}
+
+impl Negotiation {
+    /// The sides still within [`PENDING_TTL`] as of `now`.
+    ///
+    /// Admission has to agree with `record_scoped`, which drops expired sides
+    /// before it records. A side a sweep has not got to yet is already gone as
+    /// far as pairing is concerned, so refusing an INIT on its account would
+    /// turn a peer legitimately claiming a free index into a rejection that
+    /// lasts until the next sweep.
+    fn live_sides(&self, now: Instant) -> impl Iterator<Item = &Side> {
+        self.sides
+            .values()
+            .filter(move |held| now.duration_since(held.seen) <= PENDING_TTL)
+    }
+
+    /// This side's own entry, if it has one that has not expired.
+    fn live_side(&self, key: &SideKey, now: Instant) -> Option<&Side> {
+        self.sides
+            .get(key)
+            .filter(|held| now.duration_since(held.seen) <= PENDING_TTL)
+    }
+}
+
 /// Negotiations waiting for their second peer, keyed by cookie and then by
 /// [`SideKey`].
-#[derive(Default)]
 struct Pending {
-    sides: HashMap<(String, u32), HashMap<SideKey, Side>>,
+    negotiations: HashMap<(String, u32), Negotiation>,
+    policy: Policy,
+}
+
+impl Default for Pending {
+    fn default() -> Self {
+        Self::new(Policy::default())
+    }
 }
 
 /// A CONNECT this service owes a peer another copy of, claimed from the
@@ -374,12 +847,29 @@ struct DueConnect {
     cookie: u32,
     client_index: u8,
     socket: usize,
+    version: Version,
     target: SocketAddr,
     partner: SocketAddrV4,
     attempt: u32,
     /// The last attempt this service will make, so a capture records that
     /// delivery was given up on rather than merely going quiet.
     final_attempt: bool,
+}
+
+/// A side being told that no partner announced its cookie.
+///
+/// Sent once. The client answers a CONNECT only when `finished` is
+/// `FINISHED_NOERROR`, so there is no acknowledgement to retry towards; see
+/// [`natneg::Outcome`].
+#[derive(Clone, Debug)]
+struct FailedConnect {
+    title: String,
+    cookie: u32,
+    client_index: u8,
+    socket: usize,
+    version: Version,
+    target: SocketAddr,
+    waited: Duration,
 }
 
 /// What a CONNECT_ACK settled.
@@ -395,17 +885,118 @@ struct Acked {
 }
 
 impl Pending {
+    fn new(policy: Policy) -> Self {
+        Self {
+            negotiations: HashMap::new(),
+            policy,
+        }
+    }
+
     /// Record a peer and return the counterpart to introduce it to, if the
     /// other side is already here.
     #[cfg(test)]
     fn record(&mut self, cookie: u32, side: Side) -> Option<Side> {
         self.record_scoped("", cookie, side).partner
     }
+
+    /// Record a peer, or say why this INIT is not one to act on.
+    ///
+    /// Every check runs **before** the INIT is acknowledged, which is what
+    /// makes a refusal meaningful: an acknowledgement ends the peer's retry
+    /// loop, so acknowledging an INIT this service then discards would leave
+    /// the peer waiting on a negotiation that does not exist.
+    fn accept_init(
+        &mut self,
+        title: &str,
+        cookie: u32,
+        side: &Side,
+    ) -> Result<Recorded, InitRefusal> {
+        let pinned = self.policy.rebinding == Rebinding::Pin;
+        // Judged on the packet alone, so it needs no entry to compare against.
+        if pinned
+            && (!matches!(side.client_index, 0 | 1)
+                || side.port_type > natneg::port_type::NEGOTIATION_3)
+        {
+            return Err(InitRefusal::InvalidPinnedFields);
+        }
+        // Expiry is measured from this INIT's own arrival, exactly as
+        // `record_scoped` measures it, so admission and recording cannot
+        // disagree about which sides are still here.
+        let now = side.seen;
+        match self.negotiations.get(&(title.to_ascii_lowercase(), cookie)) {
+            Some(negotiation) => {
+                if negotiation.abandoned {
+                    return Err(InitRefusal::Abandoned);
+                }
+                let held = negotiation.live_side(&SideKey::of(side), now);
+                // Identity first: a version change is a different client
+                // whatever the rebinding policy, and saying so is better than
+                // reporting it as one of the pinning refusals below.
+                if let Some(held) = held
+                    && held.version != side.version
+                {
+                    return Err(InitRefusal::VersionChanged {
+                        held: held.version,
+                        announced: side.version,
+                    });
+                }
+                if pinned {
+                    // Each index belongs to one host for the whole exchange.
+                    // Scanned across every live side rather than looked up:
+                    // another host claiming this index keys to an entry of its
+                    // own, which is precisely what makes it an impostor rather
+                    // than a resend.
+                    if let Some(owner) = negotiation.live_sides(now).find(|owner| {
+                        owner.client_index == side.client_index
+                            && owner.address.ip() != side.address.ip()
+                    }) {
+                        return Err(InitRefusal::ClientHostPinned {
+                            client_index: side.client_index,
+                            held: owner.address.ip(),
+                            announced: side.address.ip(),
+                        });
+                    }
+                    if let Some(held) = held {
+                        if held.use_game_port != side.use_game_port {
+                            return Err(InitRefusal::GamePortChanged {
+                                held: held.use_game_port,
+                                announced: side.use_game_port,
+                            });
+                        }
+                        if let Some(previous) = held.mappings.get(&side.port_type)
+                            && *previous != side.address
+                        {
+                            return Err(InitRefusal::SourcePinned {
+                                port_type: side.port_type,
+                                held: *previous,
+                                announced: side.address,
+                            });
+                        }
+                    }
+                }
+            }
+            None if self.negotiations.len() >= self.policy.max_negotiations => {
+                return Err(InitRefusal::Capacity {
+                    held: self.negotiations.len(),
+                    limit: self.policy.max_negotiations,
+                });
+            }
+            None => {}
+        }
+        Ok(self.record_scoped(title, cookie, side.clone()))
+    }
+
     fn record_scoped(&mut self, title: &str, cookie: u32, mut side: Side) -> Recorded {
-        let sides = self
-            .sides
+        let created = side.seen;
+        let negotiation = self
+            .negotiations
             .entry((title.to_ascii_lowercase(), cookie))
-            .or_default();
+            .or_insert_with(|| Negotiation {
+                sides: HashMap::new(),
+                created,
+                abandoned: false,
+            });
+        let sides = &mut negotiation.sides;
         // Sweeps reclaim idle cookies, but a new INIT must not pair with a
         // peer that expired since the last sweep.
         sides.retain(|_, held| side.seen.duration_since(held.seen) <= PENDING_TTL);
@@ -417,6 +1008,16 @@ impl Pending {
         // side has been announcing and how many INITs it took, and so the
         // mappings this peer announced for its other port types survive.
         if let Some(previous) = &replaced {
+            // A peer sends one INIT per port type and they can arrive in any
+            // order, so a later one carrying a placeholder must not erase a
+            // private address an earlier one announced: `connect_address`
+            // reads it to hand a same-NAT pair each other's LAN address, and
+            // losing it downgrades them to a public address that needs
+            // hairpinning. Kept as announced when neither INIT had a usable
+            // one, so the log line still reports what the peer actually sent.
+            if usable_local(&side).is_none() {
+                side.local_address = usable_local(previous).or(side.local_address);
+            }
             side.first_seen = previous.first_seen;
             side.inits = previous.inits.saturating_add(1);
             for (port_type, address) in &previous.mappings {
@@ -445,7 +1046,21 @@ impl Pending {
         candidates.sort_by_key(|(held, side)| {
             (std::cmp::Reverse(side.seen), held.client_index, held.host)
         });
-        let partner = candidates.first().map(|(_, held)| (*held).clone());
+        // A side in another version is not a partner unless the deployment
+        // said so, but it is reported either way: to the two peers this is
+        // indistinguishable from nobody having arrived.
+        let mut version_mismatch = None;
+        let partner = candidates
+            .iter()
+            .find(|(_, held)| {
+                if held.version == current.version || self.policy.pair_across_versions {
+                    true
+                } else {
+                    version_mismatch.get_or_insert((held.client_index, held.version));
+                    false
+                }
+            })
+            .map(|(_, held)| (*held).clone());
         let mut inventory: Vec<(u8, SocketAddr, u8)> = sides
             .iter()
             .map(|(key, side)| (key.client_index, side.address, side.port_type))
@@ -456,6 +1071,7 @@ impl Pending {
             partner,
             replaced,
             inventory,
+            version_mismatch,
         }
     }
 
@@ -481,9 +1097,9 @@ impl Pending {
         now: Instant,
     ) -> bool {
         let Some(side) = self
-            .sides
+            .negotiations
             .get_mut(&(title.to_ascii_lowercase(), cookie))
-            .and_then(|sides| sides.get_mut(&key))
+            .and_then(|negotiation| negotiation.sides.get_mut(&key))
         else {
             return true;
         };
@@ -507,11 +1123,16 @@ impl Pending {
     /// every socket thread run this pass against one registry: the first to
     /// take a due CONNECT leaves nothing for the others to duplicate.
     fn due_connects(&mut self, now: Instant) -> Vec<DueConnect> {
+        let endpoint = self.policy.control_endpoint;
         let mut due = Vec::new();
-        for ((title, cookie), sides) in self.sides.iter_mut() {
-            for (key, side) in sides.iter_mut() {
-                let target = side.address;
+        for ((title, cookie), negotiation) in self.negotiations.iter_mut() {
+            if negotiation.abandoned {
+                continue;
+            }
+            for (key, side) in negotiation.sides.iter_mut() {
+                let target = control_endpoint(side, endpoint);
                 let socket = side.socket;
+                let version = side.version;
                 let Some(connect) = &mut side.connect else {
                     continue;
                 };
@@ -528,6 +1149,7 @@ impl Pending {
                     cookie: *cookie,
                     client_index: key.client_index,
                     socket,
+                    version,
                     target,
                     partner: connect.partner,
                     attempt: connect.attempts,
@@ -538,21 +1160,73 @@ impl Pending {
         due
     }
 
+    /// Every lone side whose partner wait has run out, claimed once.
+    ///
+    /// Only a negotiation still short of a second side fails this way. A pair
+    /// that is present but not yet [`is_ready`] is left to the peers' own
+    /// timers: this service has no evidence that the missing registration is
+    /// never coming, and a failure CONNECT cannot be taken back.
+    ///
+    /// Nor does a negotiation that was *already* introduced and has since lost
+    /// a side to expiry. Its remaining peer holds a CONNECT and may be
+    /// punching right now; telling it there was never a partner would end a
+    /// negotiation that is working. An armed CONNECT on any side is what marks
+    /// that, and it outlives the side that was paired with.
+    fn expired_partners(&mut self, now: Instant) -> Vec<FailedConnect> {
+        let Some(wait) = self.policy.partner_wait else {
+            return Vec::new();
+        };
+        let endpoint = self.policy.control_endpoint;
+        let mut failed = Vec::new();
+        for ((title, cookie), negotiation) in self.negotiations.iter_mut() {
+            if negotiation.abandoned
+                || negotiation.sides.len() >= 2
+                || now.duration_since(negotiation.created) < wait
+                || negotiation
+                    .sides
+                    .values()
+                    .any(|side| side.connect.is_some())
+            {
+                continue;
+            }
+            negotiation.abandoned = true;
+            for (key, side) in negotiation.sides.iter() {
+                failed.push(FailedConnect {
+                    title: title.clone(),
+                    cookie: *cookie,
+                    client_index: key.client_index,
+                    socket: side.socket,
+                    version: side.version,
+                    target: control_endpoint(side, endpoint),
+                    waited: now.duration_since(negotiation.created),
+                });
+            }
+        }
+        failed
+    }
+
     /// Stop resending the CONNECT `from` has just acknowledged.
     ///
     /// Matched on cookie and source address: the acknowledgement carries the
-    /// cookie, and it arrives from the mapping the CONNECT was sent to. Every
-    /// cookie space is searched because a CONNECT_ACK carries no title — it
-    /// has no body this project has read, let alone a name field — so the
+    /// cookie, and it arrives from one of the mappings this side announced.
+    /// Every cookie space is searched because a CONNECT_ACK carries no title —
+    /// it has no body this project has read, let alone a name field — so the
     /// registry is what resolves which negotiation it belongs to.
+    ///
+    /// **Any** announced mapping counts, not only the latest INIT's: the SDK
+    /// sends its CONNECT_ACK from the socket that received the CONNECT, which
+    /// under [`ControlEndpoint::NegotiationMapping`] is deliberately not the
+    /// most recent INIT's source. An acknowledgement from an address this
+    /// side never announced settles nothing, which is what makes this a
+    /// source check rather than a cookie lookup.
     fn acknowledge_connect(&mut self, cookie: u32, from: SocketAddr, now: Instant) -> Vec<Acked> {
         let mut acked = Vec::new();
-        for ((title, held), sides) in self.sides.iter_mut() {
+        for ((title, held), negotiation) in self.negotiations.iter_mut() {
             if *held != cookie {
                 continue;
             }
-            for (key, side) in sides.iter_mut() {
-                if side.address != from {
+            for (key, side) in negotiation.sides.iter_mut() {
+                if side.address != from && !side.mappings.values().any(|mapping| *mapping == from) {
                     continue;
                 }
                 // The peer is demonstrably still here, so this is the side's
@@ -577,9 +1251,11 @@ impl Pending {
 
     fn sweep(&mut self, now: Instant) -> Vec<u32> {
         let mut dropped = Vec::new();
-        self.sides.retain(|cookie, sides| {
-            sides.retain(|_, side| now.duration_since(side.seen) <= PENDING_TTL);
-            if sides.is_empty() {
+        self.negotiations.retain(|cookie, negotiation| {
+            negotiation
+                .sides
+                .retain(|_, side| now.duration_since(side.seen) <= PENDING_TTL);
+            if negotiation.sides.is_empty() {
                 dropped.push(cookie.1);
                 false
             } else {
@@ -608,7 +1284,37 @@ impl Pending {
 /// all three names here, use one listener to share cookie state. See the
 /// [crate DNS guide](crate) for bare labels and SDK version differences.
 pub fn spawn_with_socket(socket: UdpSocket, observer: impl Observer) -> Result<Listener, String> {
-    spawn_routes(socket, observer, None)
+    spawn_routes(socket, observer, Policy::default())
+}
+
+/// Start on an already-bound socket with an explicit [`Policy`], which is how
+/// a deployment chooses the protocol versions it accepts, the titles it
+/// routes, and the behaviours that are not derived from the version.
+///
+/// One listener serves version 3 and version 4 negotiations side by side;
+/// each participant's version is retained and every reply is encoded in the
+/// version its recipient used. Two peers that announce *different* versions
+/// for one cookie are not introduced to each other unless
+/// [`Policy::pair_across_versions`] is set, and the refusal is recorded.
+///
+/// Otherwise exactly [`spawn_with_socket`], including socket ownership and
+/// shutdown.
+pub fn spawn_with_policy(
+    socket: UdpSocket,
+    observer: impl Observer,
+    policy: Policy,
+) -> Result<Listener, String> {
+    spawn_routes(socket, observer, policy)
+}
+
+/// [`spawn_with_policy`] across several sockets sharing one cookie registry;
+/// see [`spawn_with_sockets`] for why all three SDK ports belong on one.
+pub fn spawn_sockets_with_policy(
+    sockets: Vec<UdpSocket>,
+    observer: impl Observer + Sync,
+    policy: Policy,
+) -> Result<Vec<Listener>, String> {
+    spawn_shared(sockets, observer, policy)
 }
 
 /// Serve known titles on one NAT socket, with strict named INIT admission and
@@ -618,11 +1324,7 @@ pub fn spawn_multi_with_socket(
     observer: impl Observer,
     names: Vec<String>,
 ) -> Result<Listener, String> {
-    if names.is_empty() {
-        return Err("NAT needs at least one title".into());
-    }
-    crate::distinct_titles("natneg", names.iter().map(String::as_str))?;
-    spawn_routes(socket, observer, Some(names))
+    spawn_routes(socket, observer, Policy::default().with_titles(names))
 }
 /// Serve several NAT sockets from **one** cookie registry.
 ///
@@ -648,7 +1350,7 @@ pub fn spawn_with_sockets(
     sockets: Vec<UdpSocket>,
     observer: impl Observer + Sync,
 ) -> Result<Vec<Listener>, String> {
-    spawn_shared(sockets, observer, None)
+    spawn_shared(sockets, observer, Policy::default())
 }
 
 /// [`spawn_with_sockets`] with strict named INIT admission and separate cookie
@@ -658,18 +1360,14 @@ pub fn spawn_multi_with_sockets(
     observer: impl Observer + Sync,
     names: Vec<String>,
 ) -> Result<Vec<Listener>, String> {
-    if names.is_empty() {
-        return Err("NAT needs at least one title".into());
-    }
-    crate::distinct_titles("natneg", names.iter().map(String::as_str))?;
-    spawn_shared(sockets, observer, Some(names))
+    spawn_shared(sockets, observer, Policy::default().with_titles(names))
 }
 
 /// State one negotiation service owns, shared by every socket serving it.
 struct Shared<O: Observer> {
     pending: std::sync::Mutex<Pending>,
     observer: O,
-    names: Option<Vec<String>>,
+    policy: Policy,
     sockets: Vec<UdpSocket>,
 }
 
@@ -685,11 +1383,12 @@ impl<O: Observer> Shared<O> {
 fn prepare<O: Observer>(
     sockets: &[UdpSocket],
     observer: &O,
-    names: Option<&[String]>,
+    policy: &Policy,
 ) -> Result<Vec<SocketAddr>, String> {
     if sockets.is_empty() {
         return Err("NAT needs at least one socket".into());
     }
+    policy.validate()?;
     let mut binds = Vec::with_capacity(sockets.len());
     for socket in sockets {
         socket
@@ -721,7 +1420,10 @@ fn prepare<O: Observer>(
              finished. Performs no endpoint resolution test and does \
              not serve preinit. Serves {} of the three ports the SDK probes ({}). Pairs on \
              cookie, client index and host, preferring the most recently heard-from side; \
-             title routing {}.",
+             title routing {}. Accepts protocol version(s) {}, carried per \
+             participant and echoed in every reply; mixed-version pairing {}. \
+             Readiness {:?}, connect delivered to {:?}, rebinding {:?}, init_ack \
+             {:?}, report_ack {:?}, partner wait {}, at most {} negotiations.",
             natneg::packet_type::INIT,
             natneg::packet_type::INIT_ACK,
             natneg::packet_type::CONNECT,
@@ -736,10 +1438,26 @@ fn prepare<O: Observer>(
                 .map(|bind| bind.port().to_string())
                 .collect::<Vec<_>>()
                 .join(", "),
-            match names {
+            match &policy.titles {
                 Some(names) => format!("restricted to [{}]", names.join(", ")),
                 None => "disabled (one shared cookie space)".into(),
             },
+            policy.versions_text(),
+            if policy.pair_across_versions {
+                "permitted"
+            } else {
+                "refused"
+            },
+            policy.readiness,
+            policy.control_endpoint,
+            policy.rebinding,
+            policy.init_ack,
+            policy.report_ack,
+            match policy.partner_wait {
+                Some(wait) => format!("{} ms", wait.as_millis()),
+                None => "disabled (the peer times out on its own)".into(),
+            },
+            policy.max_negotiations,
         ),
     );
     Ok(binds)
@@ -748,14 +1466,14 @@ fn prepare<O: Observer>(
 fn spawn_shared<O: Observer + Sync>(
     sockets: Vec<UdpSocket>,
     observer: O,
-    names: Option<Vec<String>>,
+    policy: Policy,
 ) -> Result<Vec<Listener>, String> {
-    prepare(&sockets, &observer, names.as_deref())?;
+    prepare(&sockets, &observer, &policy)?;
     let count = sockets.len();
     let shared = std::sync::Arc::new(Shared {
-        pending: std::sync::Mutex::new(Pending::default()),
+        pending: std::sync::Mutex::new(Pending::new(policy.clone())),
         observer,
-        names,
+        policy,
         sockets,
     });
     let mut listeners = Vec::with_capacity(count);
@@ -778,9 +1496,9 @@ fn spawn_shared<O: Observer + Sync>(
 fn spawn_routes(
     socket: UdpSocket,
     observer: impl Observer,
-    names: Option<Vec<String>>,
+    policy: Policy,
 ) -> Result<Listener, String> {
-    prepare(std::slice::from_ref(&socket), &observer, names.as_deref())?;
+    prepare(std::slice::from_ref(&socket), &observer, &policy)?;
     let stop = StopSignal::default();
     let signal = stop.clone();
     // One socket means one thread, so the state is owned by it outright and
@@ -789,9 +1507,9 @@ fn spawn_routes(
         .name("natneg".into())
         .spawn(move || {
             let shared = Shared {
-                pending: std::sync::Mutex::new(Pending::default()),
+                pending: std::sync::Mutex::new(Pending::new(policy.clone())),
                 observer,
-                names,
+                policy,
                 sockets: vec![socket],
             };
             serve(&shared, 0, &signal)
@@ -806,7 +1524,8 @@ fn spawn_routes(
 fn serve<O: Observer>(shared: &Shared<O>, index: usize, stop: &StopSignal) {
     let socket = &shared.sockets[index];
     let observer = &shared.observer;
-    let names = shared.names.as_deref();
+    let policy = &shared.policy;
+    let names = policy.titles.as_deref();
     let arrived_on = socket.local_addr().map(|bind| bind.port()).unwrap_or(0);
     let mut buffer = vec![0u8; MAX_DATAGRAM];
 
@@ -830,6 +1549,7 @@ fn serve<O: Observer>(shared: &Shared<O>, index: usize, stop: &StopSignal) {
         // this at roughly 100 ms, which is the granularity a CONNECT retry
         // interval of half a second needs.
         retry_connects(shared, now);
+        fail_without_partner(shared, now);
         let (length, peer) = match socket.recv_from(&mut buffer) {
             Ok(received) => received,
             Err(error)
@@ -862,8 +1582,18 @@ fn serve<O: Observer>(shared: &Shared<O>, index: usize, stop: &StopSignal) {
                 ),
             );
         }
-        match natneg::parse(datagram) {
+        match natneg::parse_accepting(datagram, policy.versions) {
             Ok(Packet::Init(init)) => {
+                if policy.rebinding == Rebinding::Pin
+                    && datagram.get(14).is_none_or(|flag| *flag > 1)
+                {
+                    observer.peer_event(
+                        "natneg",
+                        peer,
+                        "invalid pinned usegameport field; dropped",
+                    );
+                    continue;
+                }
                 let now = Instant::now();
                 // Title routing applies to INIT alone, because INIT is the
                 // only type that carries a name. It runs here, after the
@@ -878,7 +1608,8 @@ fn serve<O: Observer>(shared: &Shared<O>, index: usize, stop: &StopSignal) {
                     // peer that never sent one, and these checks are strict
                     // enough (an ASCII-alphanumeric name, nothing after its
                     // NUL) that a real title can fail them for every packet.
-                    let named = match natneg::parse_named_init_detailed(datagram) {
+                    let named = match natneg::parse_named_init_accepting(datagram, policy.versions)
+                    {
                         Ok(named) => named,
                         Err(refusal) => {
                             observer.peer_event(
@@ -925,16 +1656,10 @@ fn serve<O: Observer>(shared: &Shared<O>, index: usize, stop: &StopSignal) {
                 } else {
                     ""
                 };
-                // Acknowledge before pairing, and before anything that can
-                // fail. This is what ends the peer's INIT retry loop, and it
-                // is owed per port type whether or not a partner is here
-                // yet: an unacknowledged peer abandons the negotiation on its
-                // own retry budget, long before this registry would expire
-                // its entry.
-                acknowledge_init(shared, index, peer, datagram, init.cookie, init.port_type);
                 let side = Side {
                     address: peer,
                     client_index: init.client_index,
+                    version: init.version,
                     seen: now,
                     port_type: init.port_type,
                     mappings: BTreeMap::new(),
@@ -945,9 +1670,44 @@ fn serve<O: Observer>(shared: &Shared<O>, index: usize, stop: &StopSignal) {
                     inits: 1,
                     connect: None,
                 };
-                let recorded = shared
-                    .pending()
-                    .record_scoped(title, init.cookie, side.clone());
+                // Admission runs before the acknowledgement, and the
+                // acknowledgement before pairing.
+                //
+                // An INIT_ACK is what ends the peer's retry loop, and it is
+                // owed per port type whether or not a partner is here yet: an
+                // unacknowledged peer abandons the negotiation on its own
+                // retry budget, long before this registry would expire its
+                // entry. But it must not be owed for an INIT the registry
+                // then discards — that would stop the peer resending while
+                // this service holds nothing for it. So the checks that can
+                // refuse an INIT run first, and a refusal is recorded with
+                // its reason and dropped silently, exactly as an unroutable
+                // named INIT is.
+                let recorded = match shared.pending().accept_init(title, init.cookie, &side) {
+                    Ok(recorded) => recorded,
+                    Err(refusal) => {
+                        observer.peer_event(
+                            "natneg",
+                            peer,
+                            &format!(
+                                "drop trace: init for {:#010x} title={title:?} index={} \
+                                 port_type={} is not accepted, and is not acknowledged: \
+                                 {refusal}",
+                                init.cookie, init.client_index, init.port_type,
+                            ),
+                        );
+                        continue;
+                    }
+                };
+                acknowledge_init(
+                    shared,
+                    index,
+                    peer,
+                    datagram,
+                    init.cookie,
+                    init.port_type,
+                    init.version,
+                );
                 // Every field of the INIT, including the three this service
                 // does not act on. `port_type` and `use_game_port` decide
                 // which of a peer's sockets the address belongs to, and
@@ -998,6 +1758,20 @@ fn serve<O: Observer>(shared: &Shared<O>, index: usize, stop: &StopSignal) {
                 for anomaly in duplicate_client_indices(&recorded.inventory) {
                     observer.peer_event("natneg", peer, &format!("anomaly: {anomaly}"));
                 }
+                if let Some((other_index, other_version)) = recorded.version_mismatch {
+                    observer.peer_event(
+                        "natneg",
+                        peer,
+                        &format!(
+                            "anomaly: {}",
+                            Anomaly::MixedVersionPair {
+                                this_side: (init.client_index, init.version),
+                                other_side: (other_index, other_version),
+                                paired: false,
+                            }
+                        ),
+                    );
+                }
 
                 match &recorded.partner {
                     Some(partner) => observer.peer_event(
@@ -1029,10 +1803,46 @@ fn serve<O: Observer>(shared: &Shared<O>, index: usize, stop: &StopSignal) {
                 }
 
                 if let Some(partner) = &recorded.partner {
-                    introduce(shared, title, init.cookie, &recorded.current, partner);
+                    // Readiness is checked for both sides, not just this one:
+                    // an introduction names each peer to the other, so a
+                    // partner that has not finished announcing its sockets
+                    // would be advertised at whichever mapping arrived first.
+                    let unready: Vec<&Side> = [&recorded.current, partner]
+                        .into_iter()
+                        .filter(|side| !is_ready(side, policy.readiness))
+                        .collect();
+                    if unready.is_empty() {
+                        introduce(shared, title, init.cookie, &recorded.current, partner);
+                    } else {
+                        observer.peer_event(
+                            "natneg",
+                            peer,
+                            &format!(
+                                "pairing {:#010x} is held: {} (configured readiness is \
+                                 {:?}, so a side is introduced only once it has announced \
+                                 every negotiation port type it will use)",
+                                init.cookie,
+                                unready
+                                    .iter()
+                                    .map(|side| format!(
+                                        "index {} is still missing port type(s) {}",
+                                        side.client_index,
+                                        missing_registrations(side)
+                                            .iter()
+                                            .map(u8::to_string)
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    ))
+                                    .collect::<Vec<_>>()
+                                    .join("; "),
+                                policy.readiness,
+                            ),
+                        );
+                    }
                 }
             }
-            Ok(Packet::ConnectAck { cookie }) => {
+            Ok(Packet::ConnectAck { version, cookie }) => {
+                let _ = version;
                 // The only thing that stops this service resending a CONNECT.
                 let acked = shared
                     .pending()
@@ -1101,9 +1911,11 @@ fn serve<O: Observer>(shared: &Shared<O>, index: usize, stop: &StopSignal) {
                 );
             }
             Ok(Packet::Unacted {
+                version,
                 packet_type,
                 cookie,
             }) => {
+                let _ = version;
                 // Protocol traffic, not a malformed datagram: recognised and
                 // named rather than dumped as bytes.
                 observer.peer_event(
@@ -1146,6 +1958,7 @@ fn acknowledge_init<O: Observer>(
     datagram: &[u8],
     cookie: u32,
     port_type: u8,
+    version: Version,
 ) {
     let observer = &shared.observer;
     if port_type > natneg::port_type::NEGOTIATION_3 {
@@ -1164,7 +1977,7 @@ fn acknowledge_init<O: Observer>(
             ),
         );
     }
-    let Some(packet) = natneg::init_ack(datagram) else {
+    let Some(packet) = natneg::init_ack_shaped(datagram, shared.policy.init_ack) else {
         // Unreachable for a parsed INIT, which is at least a header long.
         observer.peer_event(
             "natneg",
@@ -1177,7 +1990,12 @@ fn acknowledge_init<O: Observer>(
         Ok(_) => observer.peer_event(
             "natneg",
             peer,
-            &format!("init_ack sent for {cookie:#010x}: port_type {port_type}"),
+            &format!(
+                "init_ack sent for {cookie:#010x}: port_type {port_type}, version {version}, \
+                 {} bytes ({:?})",
+                packet.len(),
+                shared.policy.init_ack,
+            ),
         ),
         Err(error) => observer.peer_event(
             "natneg",
@@ -1209,7 +2027,7 @@ fn acknowledge_report<O: Observer>(
     report: &natneg::Report,
 ) {
     let observer = &shared.observer;
-    let Some(packet) = natneg::report_ack(datagram) else {
+    let Some(packet) = natneg::report_ack_shaped(datagram, shared.policy.report_ack) else {
         // Unreachable for a parsed report, which is at least a header long.
         observer.peer_event(
             "natneg",
@@ -1222,7 +2040,13 @@ fn acknowledge_report<O: Observer>(
         Ok(_) => observer.peer_event(
             "natneg",
             peer,
-            &format!("report_ack sent for {:#010x}", report.cookie),
+            &format!(
+                "report_ack sent for {:#010x}: version {}, {} bytes ({:?})",
+                report.cookie,
+                report.version,
+                packet.len(),
+                shared.policy.report_ack,
+            ),
         ),
         Err(error) => observer.peer_event(
             "natneg",
@@ -1237,28 +2061,56 @@ fn acknowledge_report<O: Observer>(
     }
 }
 
+/// One CONNECT about to go on the wire: who it is for, in which version, and
+/// which attempt it is.
+///
+/// Grouped rather than passed as seven arguments because every field has to
+/// agree with the others — the socket with the target, the version with the
+/// recipient — and a struct is what makes a mismatch a compile error at the
+/// call site rather than a transposition.
+#[derive(Clone, Copy, Debug)]
+struct Delivery {
+    socket: usize,
+    target: SocketAddr,
+    cookie: u32,
+    version: Version,
+    partner: SocketAddrV4,
+    attempt: u32,
+    final_attempt: bool,
+}
+
 /// Send one CONNECT to one side, from the socket that side's INIT arrived on.
 ///
 /// Delivery is retried by [`Pending::due_connects`] until the peer
 /// acknowledges it, so a send failure here is not the end of the attempt.
-fn deliver_connect<O: Observer>(
-    shared: &Shared<O>,
-    socket: usize,
-    target: SocketAddr,
-    cookie: u32,
-    partner: SocketAddrV4,
-    attempt: u32,
-    final_attempt: bool,
-) {
+fn deliver_connect<O: Observer>(shared: &Shared<O>, delivery: Delivery) {
+    let Delivery {
+        socket,
+        target,
+        cookie,
+        version,
+        partner,
+        attempt,
+        final_attempt,
+    } = delivery;
     let observer = &shared.observer;
-    let packet = natneg::connect(cookie, partner.ip().octets(), partner.port());
+    // In the recipient's own version, not this build's: the version byte is
+    // the one field a reply must take from the peer rather than decide.
+    let packet = natneg::connect_versioned(
+        version,
+        cookie,
+        partner.ip().octets(),
+        partner.port(),
+        natneg::Outcome::Introduced,
+    );
     match shared.sockets[socket].send_to(&packet, target) {
         Ok(_) => observer.peer_event(
             "natneg",
             target,
             &format!(
-                "connect sent for {cookie:#010x}: partner {partner} (attempt {attempt} of \
-                 {CONNECT_ATTEMPTS}; resent every {} ms until the peer acknowledges it){}",
+                "connect sent for {cookie:#010x}: partner {partner}, version {version} \
+                 (attempt {attempt} of {CONNECT_ATTEMPTS}; resent every {} ms until the \
+                 peer acknowledges it){}",
                 CONNECT_RETRY.as_millis(),
                 if final_attempt {
                     ", the last this service will send"
@@ -1295,12 +2147,60 @@ fn retry_connects<O: Observer>(shared: &Shared<O>, now: Instant) {
         );
         deliver_connect(
             shared,
-            connect.socket,
-            connect.target,
-            connect.cookie,
-            connect.partner,
-            connect.attempt,
-            connect.final_attempt,
+            Delivery {
+                socket: connect.socket,
+                target: connect.target,
+                cookie: connect.cookie,
+                version: connect.version,
+                partner: connect.partner,
+                attempt: connect.attempt,
+                final_attempt: connect.final_attempt,
+            },
+        );
+    }
+}
+
+/// Tell every lone side whose partner never arrived, once each.
+///
+/// A CONNECT carrying `FINISHED_ERROR_DEADBEAT_PARTNER` is what turns a
+/// silent stall into a failure the title can report: the client maps that
+/// byte to `nr_deadbeatpartner` and finishes. It is deliberately **not**
+/// retried — `ProcessConnectPacket` acknowledges only `FINISHED_NOERROR`, so
+/// there is no acknowledgement to wait for and a retry loop would never end.
+///
+/// Does nothing unless [`Policy::partner_wait`] is set, which is why an
+/// existing embedder sees no new packet type by upgrading.
+fn fail_without_partner<O: Observer>(shared: &Shared<O>, now: Instant) {
+    // Claimed under the lock and sent with it released, like the retry pass:
+    // an observer callback runs application code.
+    let failed = shared.pending().expired_partners(now);
+    for failure in failed {
+        let packet = natneg::connect_versioned(
+            failure.version,
+            failure.cookie,
+            [0, 0, 0, 0],
+            0,
+            natneg::Outcome::NoPartner,
+        );
+        let sent = shared.sockets[failure.socket].send_to(&packet, failure.target);
+        shared.observer.peer_event(
+            "natneg",
+            failure.target,
+            &format!(
+                "no partner for {:#010x} title={:?} index {} after {} ms: sending a connect \
+                 carrying finished={} (FINISHED_ERROR_DEADBEAT_PARTNER), which this client \
+                 maps to nr_deadbeatpartner and does not acknowledge, so it is sent once and \
+                 this cookie is closed to further inits{}",
+                failure.cookie,
+                failure.title,
+                failure.client_index,
+                failure.waited.as_millis(),
+                natneg::finished::DEADBEAT_PARTNER,
+                match sent {
+                    Ok(_) => String::new(),
+                    Err(error) => format!("; the send failed and will not be retried: {error}"),
+                },
+            ),
         );
     }
 }
@@ -1323,7 +2223,23 @@ fn introduce<O: Observer>(shared: &Shared<O>, title: &str, cookie: u32, one: &Si
             mappings(two),
         ),
     );
+    if one.version != two.version {
+        // Reachable only with Policy::pair_across_versions, since otherwise
+        // these two were never offered to each other as partners.
+        observer.event(
+            "natneg",
+            &format!(
+                "anomaly: {}",
+                Anomaly::MixedVersionPair {
+                    this_side: (one.client_index, one.version),
+                    other_side: (two.client_index, two.version),
+                    paired: true,
+                }
+            ),
+        );
+    }
     for (target, partner) in [(one, two), (two, one)] {
+        let endpoint = control_endpoint(target, shared.policy.control_endpoint);
         let (chosen, reason) = connect_address(target, partner);
         let (address, port) = match chosen {
             ConnectAddress::Private(address) => (*address.ip(), address.port()),
@@ -1343,19 +2259,21 @@ fn introduce<O: Observer>(shared: &Shared<O>, title: &str, cookie: u32, one: &Si
                 (mapped, address.port())
             }
         };
-        // Which address was chosen and why, every time. A peer that cannot
+        // Which address was chosen and why, every time, and where the packet
+        // itself is going — which is a separate question. A peer that cannot
         // reach the address we named leaves no trace of its own, so this is
         // the only record of what it was told to punch.
         observer.peer_event(
             "natneg",
-            target.address,
+            endpoint,
             &format!(
                 "connect address for {cookie:#010x}: {} {address}:{port} ({reason}); \
-                 partner public={} local={}",
+                 delivered to {endpoint} ({:?}); partner public={} local={}",
                 match chosen {
                     ConnectAddress::Private(_) => "private",
                     ConnectAddress::Public(_) => "public",
                 },
+                shared.policy.control_endpoint,
                 advertised_mapping(partner),
                 local(partner.local_address),
             ),
@@ -1372,7 +2290,7 @@ fn introduce<O: Observer>(shared: &Shared<O>, title: &str, cookie: u32, one: &Si
         {
             observer.peer_event(
                 "natneg",
-                target.address,
+                endpoint,
                 &format!(
                     "connect for {cookie:#010x} naming {named} is already being delivered \
                      or acknowledged; not duplicating it"
@@ -1384,12 +2302,15 @@ fn introduce<O: Observer>(shared: &Shared<O>, title: &str, cookie: u32, one: &Si
         // socket happens to be running this pairing.
         deliver_connect(
             shared,
-            target.socket,
-            target.address,
-            cookie,
-            named,
-            1,
-            CONNECT_ATTEMPTS <= 1,
+            Delivery {
+                socket: target.socket,
+                target: endpoint,
+                cookie,
+                version: target.version,
+                partner: named,
+                attempt: 1,
+                final_attempt: CONNECT_ATTEMPTS <= 1,
+            },
         );
     }
 }

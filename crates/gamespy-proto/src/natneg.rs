@@ -1,4 +1,21 @@
-//! Natneg.
+//! NAT negotiation wire codec, for protocol versions 3 and 4.
+//!
+//! One codec serves both generations because they share one layout: the pinned
+//! SDK header is `#define NN_PROTVER 3` and its packed packet structs are the
+//! ones this crate already parsed for version 4, with the same
+//! `BASEPACKET_SIZE` 12, `INITPACKET_SIZE` 21, `CONNECTPACKET_SIZE` 20 and
+//! `REPORTPACKET_SIZE` 73. The version byte at offset 6 is carried in every
+//! decoded packet as a [`Version`] so a reply can be encoded in the version
+//! its recipient used — see that type for why nothing else may be decided
+//! from it, and why the client's own receive path never reads it.
+//!
+//! [`parse`] accepts both versions and refuses any other byte with
+//! [`NatNegError::UnsupportedVersion`]; [`parse_accepting`] narrows that to
+//! what a deployment serves.
+//!
+//! Reply *shapes* are deployment policy, not version: [`InitAckShape`] and
+//! [`ReportAckShape`] each offer two forms that the referenced client cannot
+//! tell apart, documented with the SDK evidence for that claim.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -9,9 +26,139 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 /// client-message branch (`0x00ae6480`).
 pub const MAGIC: [u8; 6] = [0xFD, 0xFC, 0x1E, 0x66, 0x6A, 0xB2];
 
-/// Protocol version this client puts in the packets it builds
-/// (`li r4, 4` stored at offset 6, `0x00ae27d0`/`0x00ae2800`).
+/// Protocol version this project's reference client puts in the packets it
+/// builds (`li r4, 4` stored at offset 6, `0x00ae27d0`/`0x00ae2800`).
+///
+/// Retained as the byte [`connect`] emits, so an embedder that already serves
+/// version 4 keeps its reply format byte for byte. New code should carry a
+/// [`Version`] instead and encode with [`connect_versioned`].
 pub const VERSION: u8 = 4;
+
+/// A negotiation protocol version this crate reads and writes.
+///
+/// **The version byte carries no layout difference between these two
+/// generations.** The pinned SDK header is `#define NN_PROTVER 3`, with
+/// `//#define NN_PROTVER 2` commented out above it, and every packet struct in
+/// it — `InitPacket`, `ConnectPacket`, `ReportPacket`, all under `#pragma
+/// pack(1)` — is exactly the layout this crate already parsed for version 4,
+/// with the same `BASEPACKET_SIZE` 12, `INITPACKET_SIZE` 21,
+/// `CONNECTPACKET_SIZE` 20 and `REPORTPACKET_SIZE` 73. The two versions
+/// differ in that one byte and nothing else, which is why one parser and one
+/// negotiation engine serve both.
+///
+/// It is still carried per packet and per participant, for three reasons that
+/// have nothing to do with layout:
+///
+/// - a reply has to be encoded in the version its *recipient* used, since
+///   that is the only version that peer will recognise if it ever does check;
+/// - a participant whose version changes mid-negotiation is not a resend of
+///   the one already held, and silently overwriting it would hide that;
+/// - pairing two peers that disagree about the version is a deployment
+///   policy decision, not something to fall into by accident.
+///
+/// `NNProcessData` in the referenced SDK checks the magic and a minimum
+/// length and **never compares the version byte on receive**. So this is a
+/// recipient-matching courtesy rather than something the wire enforces — and
+/// it is why nothing else in this crate may be decided from the version. Reply
+/// *shapes* are [`InitAckShape`] and [`ReportAckShape`], which are server
+/// policy and configured separately.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Version {
+    /// `NN_PROTVER 3`, the version the pinned SDK generation emits and the
+    /// one the mkvsdcu consumer requires.
+    V3 = 3,
+    /// `NN_PROTVER 4`, the version this project read out of its reference
+    /// client binary.
+    V4 = 4,
+}
+
+impl Version {
+    /// Every version this crate serves, lowest first.
+    pub const SUPPORTED: [Version; 2] = [Version::V3, Version::V4];
+
+    /// The version a byte at offset 6 names, or `None` for one this crate has
+    /// no evidence for.
+    pub const fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            3 => Some(Self::V3),
+            4 => Some(Self::V4),
+            _ => None,
+        }
+    }
+
+    /// The byte this version occupies offset 6 with.
+    pub const fn as_byte(self) -> u8 {
+        self as u8
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.as_byte())
+    }
+}
+
+/// `finished` bytes a server-sent CONNECT can carry, from the SDK's own
+/// `nninternal.h`.
+///
+/// The client acknowledges **only** [`finished::NO_ERROR`]: `ProcessConnectPacket`
+/// guards `SendConnectAck` with `finished == FINISHED_NOERROR` and treats
+/// every other value as a terminal error it reports to the title instead. So a
+/// non-zero byte ends that peer's negotiation and must never be sent for an
+/// introduction that is meant to succeed — and, equally, a failure CONNECT is
+/// never acknowledged and must not be retried waiting for one.
+pub mod finished {
+    /// `FINISHED_NOERROR`. The partner address in this packet is real.
+    pub const NO_ERROR: u8 = 0;
+    /// `FINISHED_ERROR_DEADBEAT_PARTNER`, which the client maps to
+    /// `nr_deadbeatpartner`: no second peer announced this cookie.
+    pub const DEADBEAT_PARTNER: u8 = 1;
+    /// `FINISHED_ERROR_INIT_PACKETS_TIMEDOUT`, which maps to
+    /// `nr_inittimeout`.
+    pub const INIT_PACKETS_TIMEDOUT: u8 = 2;
+}
+
+/// What a CONNECT tells its recipient: an address to punch, or why there will
+/// not be one.
+///
+/// A named outcome rather than a bare byte because the two differ in more than
+/// the byte: a failure CONNECT carries no usable address, is not acknowledged
+/// by the client, and therefore must not be retried.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Outcome {
+    /// `FINISHED_NOERROR`: the address in the packet is the partner's.
+    Introduced,
+    /// `FINISHED_ERROR_DEADBEAT_PARTNER`: no partner announced this cookie
+    /// before the server gave up waiting.
+    NoPartner,
+    /// `FINISHED_ERROR_INIT_PACKETS_TIMEDOUT`.
+    InitTimedOut,
+    /// Any other `finished` byte, for a deployment that has evidence for one
+    /// this crate does not name. Zero is not permitted here: it would claim
+    /// success, and [`Outcome::Introduced`] is how success is said.
+    Other(std::num::NonZeroU8),
+}
+
+impl Outcome {
+    /// The `finished` byte at [`CONNECT_LEN`] - 1.
+    pub const fn finished_byte(self) -> u8 {
+        match self {
+            Self::Introduced => finished::NO_ERROR,
+            Self::NoPartner => finished::DEADBEAT_PARTNER,
+            Self::InitTimedOut => finished::INIT_PACKETS_TIMEDOUT,
+            Self::Other(byte) => byte.get(),
+        }
+    }
+
+    /// Whether the client will answer this CONNECT with a CONNECT_ACK.
+    ///
+    /// Only a successful introduction is acknowledged, so this is also the
+    /// answer to "may this CONNECT be retried until an acknowledgement
+    /// arrives?". Retrying a failure would resend forever.
+    pub const fn is_acknowledged(self) -> bool {
+        matches!(self, Self::Introduced)
+    }
+}
 
 /// Header bytes before the body: magic, version, type, cookie.
 pub const HEADER_LEN: usize = 12;
@@ -108,6 +255,17 @@ pub mod port_type {
 pub enum NatNegError {
     TooShort,
     WrongMagic,
+    /// A version byte at offset 6 that this parser was not asked to accept.
+    ///
+    /// Carries the byte as sent, and the versions that *were* accepted, so a
+    /// listener can say whether it refused a generation this crate has no
+    /// evidence for or one the deployment chose not to serve. Those are very
+    /// different operational problems and a bare "bad version" cannot tell
+    /// them apart.
+    UnsupportedVersion {
+        version: u8,
+        accepted: &'static [Version],
+    },
     /// A type this build does not serve. Carried so a listener can log it
     /// with its bytes rather than guess.
     UnhandledType(u8),
@@ -118,6 +276,24 @@ impl std::fmt::Display for NatNegError {
         match self {
             Self::TooShort => formatter.write_str("datagram shorter than a negotiation header"),
             Self::WrongMagic => formatter.write_str("not a negotiation packet"),
+            Self::UnsupportedVersion { version, accepted } => {
+                let listed = accepted
+                    .iter()
+                    .map(Version::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if accepted.len() == Version::SUPPORTED.len() {
+                    write!(
+                        formatter,
+                        "protocol version {version} is not a generation this crate serves (serving {listed})"
+                    )
+                } else {
+                    write!(
+                        formatter,
+                        "protocol version {version} is not accepted by this deployment (accepting {listed})"
+                    )
+                }
+            }
             Self::UnhandledType(value) => {
                 write!(formatter, "unhandled negotiation packet type {value:#04x}")
             }
@@ -142,6 +318,9 @@ impl std::fmt::Display for NatNegError {
 /// record it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Init {
+    /// The version this peer announced; see [`Version`]. A reply to this INIT
+    /// is encoded in it.
+    pub version: Version,
     pub cookie: u32,
     pub port_type: u8,
     pub client_index: u8,
@@ -171,6 +350,8 @@ pub struct Init {
 ///   `BASEPACKET_SIZE + 61`. It is read on that assumption and validated.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Report {
+    /// The version this peer announced; see [`Version`].
+    pub version: Version,
     pub cookie: u32,
     pub client_index: u8,
     /// `negResult`, which despite the name is **not** a `NegotiateResult`:
@@ -204,6 +385,7 @@ pub enum Packet {
     /// it is what names the negotiation being acknowledged, and the body has
     /// not been traced in this project.
     ConnectAck {
+        version: Version,
         cookie: u32,
     },
     /// A peer reporting the outcome of its negotiation, which must be
@@ -219,9 +401,30 @@ pub enum Packet {
     /// Recognised rather than refused so a listener records it as protocol
     /// traffic instead of as a malformed datagram.
     Unacted {
+        version: Version,
         packet_type: u8,
         cookie: u32,
     },
+}
+
+impl Packet {
+    /// The version the sender announced, whichever type this is.
+    pub fn version(&self) -> Version {
+        match self {
+            Self::Init(init) => init.version,
+            Self::Report(report) => report.version,
+            Self::ConnectAck { version, .. } | Self::Unacted { version, .. } => *version,
+        }
+    }
+
+    /// The cookie naming the negotiation this packet belongs to.
+    pub fn cookie(&self) -> u32 {
+        match self {
+            Self::Init(init) => init.cookie,
+            Self::Report(report) => report.cookie,
+            Self::ConnectAck { cookie, .. } | Self::Unacted { cookie, .. } => *cookie,
+        }
+    }
 }
 
 /// Offset of the peer's own address inside an INIT body.
@@ -244,6 +447,7 @@ const REPORT_NAME_OFFSET: usize = REPORT_NAT_OFFSET + 8;
 /// refusing to release it. Absent fields are reported absent.
 pub fn report_of(datagram: &[u8]) -> Option<Report> {
     let cookie = cookie_of(datagram)?;
+    let version = Version::from_byte(datagram[6])?;
     let game_name = datagram
         .get(REPORT_NAME_OFFSET..REPORT_NAME_OFFSET + 50)
         .and_then(|field| {
@@ -252,6 +456,7 @@ pub fn report_of(datagram: &[u8]) -> Option<Report> {
             (!name.is_empty()).then(|| name.to_owned())
         });
     Some(Report {
+        version,
         cookie,
         client_index: datagram.get(13).copied().unwrap_or(0),
         success: datagram.get(14).copied().unwrap_or(0) != 0,
@@ -299,14 +504,47 @@ pub fn cookie_of(datagram: &[u8]) -> Option<u32> {
     ]))
 }
 
-/// Parse a datagram from a peer.
+/// Parse a datagram from a peer, accepting every version this crate serves.
+///
+/// Equivalent to [`parse_accepting`] with [`Version::SUPPORTED`]. A deployment
+/// that serves one generation only should use `parse_accepting` so a packet in
+/// the other is refused with a reason rather than answered.
+///
+/// **Behaviour change in 0.1.3.** This used to ignore the version byte
+/// entirely, so a datagram claiming any version at all was parsed as long as
+/// its magic and layout held. It now refuses a byte that is neither 3 nor 4
+/// with [`NatNegError::UnsupportedVersion`], which carries the byte for the
+/// log. Version 2 is named in the SDK header but commented out, and this
+/// project has read no packet of it, so it is refused rather than guessed at.
 pub fn parse(datagram: &[u8]) -> Result<Packet, NatNegError> {
+    parse_accepting(datagram, &Version::SUPPORTED)
+}
+
+/// Parse a datagram, accepting only the listed versions.
+///
+/// `accepted` is what a deployment chose to serve, which is narrower than what
+/// this crate can decode. Refusing here rather than in the caller is what
+/// keeps an unaccepted packet from reaching the negotiation engine at all, so
+/// no state is created for it and no reply is owed.
+pub fn parse_accepting(
+    datagram: &[u8],
+    accepted: &'static [Version],
+) -> Result<Packet, NatNegError> {
     if datagram.len() < HEADER_LEN {
         return Err(NatNegError::TooShort);
     }
     if datagram[..MAGIC.len()] != MAGIC {
         return Err(NatNegError::WrongMagic);
     }
+    // Checked before the type, and before any field is read: a version this
+    // deployment does not serve is not a packet to act on, whatever it says
+    // it is.
+    let version = Version::from_byte(datagram[6])
+        .filter(|version| accepted.contains(version))
+        .ok_or(NatNegError::UnsupportedVersion {
+            version: datagram[6],
+            accepted,
+        })?;
     let packet_type = datagram[7];
     let cookie = cookie_of(datagram).ok_or(NatNegError::TooShort)?;
     match packet_type {
@@ -318,6 +556,7 @@ pub fn parse(datagram: &[u8]) -> Result<Packet, NatNegError> {
             let use_game_port = datagram.get(14).copied().unwrap_or(0) != 0;
             let local_address = local_address_of(datagram);
             Ok(Packet::Init(Init {
+                version,
                 cookie,
                 port_type,
                 client_index,
@@ -325,7 +564,7 @@ pub fn parse(datagram: &[u8]) -> Result<Packet, NatNegError> {
                 local_address,
             }))
         }
-        packet_type::CONNECT_ACK => Ok(Packet::ConnectAck { cookie }),
+        packet_type::CONNECT_ACK => Ok(Packet::ConnectAck { version, cookie }),
         packet_type::REPORT => Ok(Packet::Report(
             report_of(datagram).ok_or(NatNegError::TooShort)?,
         )),
@@ -334,6 +573,7 @@ pub fn parse(datagram: &[u8]) -> Result<Packet, NatNegError> {
         | packet_type::CONNECT
         | packet_type::CONNECT_PING
         | packet_type::PREINIT_ACK => Ok(Packet::Unacted {
+            version,
             packet_type,
             cookie,
         }),
@@ -370,8 +610,48 @@ pub fn parse(datagram: &[u8]) -> Result<Packet, NatNegError> {
 ///
 /// `None` when the datagram is shorter than a header, which is not an INIT.
 pub fn init_ack(init: &[u8]) -> Option<Vec<u8>> {
+    init_ack_shaped(init, InitAckShape::Echoed)
+}
+
+/// How an INIT_ACK body is filled.
+///
+/// **Both shapes are correct**, which is why this is configuration and not a
+/// version. `ProcessInitPacket` in the referenced SDK reads exactly one field
+/// out of an INIT_ACK — `porttype`, which it bounds-checks against `NN_PT_NN3`
+/// and uses to tick off the source it acknowledges — and reaches that switch
+/// only through the `len < INITPACKET_SIZE` gate, so any 21-byte INIT_ACK
+/// carrying the right port type ends the retry loop. The remaining body bytes
+/// are read by nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum InitAckShape {
+    /// Echo the INIT's nine body bytes back, padding a short INIT with
+    /// zeroes. Cannot disagree with the peer about any field, including the
+    /// ones this crate does not interpret.
+    #[default]
+    Echoed,
+    /// Build the body from the fields a server is sure of — port type and
+    /// client index — leaving `usegameport` and the local address zero.
+    ///
+    /// This is what the mkvsdcu v3 listener emits. It differs from
+    /// [`InitAckShape::Echoed`] in bytes 14..21 only, which that client reads
+    /// out of an INIT_ACK nowhere, so the two are interchangeable on the wire.
+    /// It exists so a migrating deployment can keep its replies byte-identical
+    /// while it changes one thing at a time.
+    Fields,
+}
+
+/// [`init_ack`] with the body shape chosen explicitly.
+pub fn init_ack_shaped(init: &[u8], shape: InitAckShape) -> Option<Vec<u8>> {
     if init.len() < HEADER_LEN {
         return None;
+    }
+    if let InitAckShape::Fields = shape {
+        return Some(init_ack_fields(
+            Version::from_byte(init[6])?,
+            cookie_of(init)?,
+            init.get(12).copied().unwrap_or(0),
+            init.get(13).copied().unwrap_or(0),
+        ));
     }
     let mut packet = Vec::with_capacity(INIT_WITH_ADDRESS_LEN);
     packet.extend_from_slice(&MAGIC);
@@ -385,6 +665,23 @@ pub fn init_ack(init: &[u8]) -> Option<Vec<u8>> {
     packet.resize(INIT_WITH_ADDRESS_LEN, 0);
     debug_assert_eq!(packet.len(), INIT_WITH_ADDRESS_LEN);
     Some(packet)
+}
+
+/// Build an INIT_ACK from fields rather than from the INIT's bytes.
+///
+/// [`INIT_WITH_ADDRESS_LEN`] bytes, the SDK's `INITPACKET_SIZE`, with the port
+/// type and client index set and the rest of the body zero. See
+/// [`InitAckShape::Fields`] for when that is the right shape; [`init_ack`] is
+/// the better default because it cannot disagree with the peer.
+pub fn init_ack_fields(version: Version, cookie: u32, port_type: u8, client_index: u8) -> Vec<u8> {
+    let mut packet = vec![0u8; INIT_WITH_ADDRESS_LEN];
+    packet[..MAGIC.len()].copy_from_slice(&MAGIC);
+    packet[6] = version.as_byte();
+    packet[7] = packet_type::INIT_ACK;
+    packet[8..HEADER_LEN].copy_from_slice(&cookie.to_be_bytes());
+    packet[12] = port_type;
+    packet[13] = client_index;
+    packet
 }
 
 /// Build the REPORT_ACK that releases a peer from `ns_reportsent`.
@@ -403,8 +700,47 @@ pub fn init_ack(init: &[u8]) -> Option<Vec<u8>> {
 ///
 /// `None` when the datagram is shorter than a header, which is not a report.
 pub fn report_ack(report: &[u8]) -> Option<Vec<u8>> {
+    report_ack_shaped(report, ReportAckShape::Echoed)
+}
+
+/// How long a REPORT_ACK is, and what its body holds.
+///
+/// **Both shapes release the peer**, which is why this is configuration and
+/// not a version. A REPORT_ACK reaches `ProcessInitPacket` through the
+/// `len < INITPACKET_SIZE` gate — 21 bytes — and its handler reads **no body
+/// field at all**: it sets `ns_reportack`, fires the title's completed
+/// callback with the result the console already stored, and cancels the
+/// negotiator. Anything from 21 bytes up with the right type and cookie ends
+/// `ns_reportsent`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ReportAckShape {
+    /// The report echoed back at [`REPORT_LEN`] (73 bytes), with only the type
+    /// byte changed. What this crate has always emitted.
+    #[default]
+    Echoed,
+    /// [`INIT_WITH_ADDRESS_LEN`] (21 bytes): the init-family length, with the
+    /// client index set and the rest of the body zero.
+    ///
+    /// What the mkvsdcu v3 listener emits, and the minimum the client's own
+    /// length gate accepts. Kept available so a migrating deployment's
+    /// REPORT_ACK stays the 21 bytes its captures show.
+    InitBody,
+}
+
+/// [`report_ack`] with the length and body shape chosen explicitly.
+pub fn report_ack_shaped(report: &[u8], shape: ReportAckShape) -> Option<Vec<u8>> {
     if report.len() < HEADER_LEN {
         return None;
+    }
+    if let ReportAckShape::InitBody = shape {
+        let mut packet = init_ack_fields(
+            Version::from_byte(report[6])?,
+            cookie_of(report)?,
+            0,
+            report.get(13).copied().unwrap_or(0),
+        );
+        packet[7] = packet_type::REPORT_ACK;
+        return Some(packet);
     }
     let mut packet = Vec::with_capacity(REPORT_LEN);
     packet.extend_from_slice(&MAGIC);
@@ -435,15 +771,42 @@ pub fn report_ack(report: &[u8]) -> Option<Vec<u8>> {
 /// peer-to-peer exchange that follows and this project has not traced the
 /// client's use of it.
 pub fn connect(cookie: u32, peer_address: [u8; 4], peer_port: u16) -> Vec<u8> {
+    connect_versioned(
+        Version::V4,
+        cookie,
+        peer_address,
+        peer_port,
+        Outcome::Introduced,
+    )
+}
+
+/// [`connect`] in a chosen version, and able to say that there is no partner.
+///
+/// Still [`CONNECT_LEN`] bytes exactly; `version` fills offset 6 and
+/// `outcome` the last byte. A failure outcome is how a server tells a peer
+/// promptly that nothing is coming, instead of leaving it to burn its own
+/// `PARTNER_WAIT_TIME`; see [`Outcome`], and note that such a CONNECT is
+/// never acknowledged and so must not be retried.
+///
+/// The address is sent as given. For a failure outcome there is nothing to
+/// punch, and an unspecified address with a zero port is the conventional
+/// filler — the client does not read the address on a non-zero `finished`.
+pub fn connect_versioned(
+    version: Version,
+    cookie: u32,
+    peer_address: [u8; 4],
+    peer_port: u16,
+    outcome: Outcome,
+) -> Vec<u8> {
     let mut packet = Vec::with_capacity(CONNECT_LEN);
     packet.extend_from_slice(&MAGIC);
-    packet.push(VERSION);
+    packet.push(version.as_byte());
     packet.push(packet_type::CONNECT);
     packet.extend_from_slice(&cookie.to_be_bytes());
     packet.extend_from_slice(&peer_address);
     packet.extend_from_slice(&peer_port.to_be_bytes());
     packet.push(0); // got-your-data
-    packet.push(0); // finished
+    packet.push(outcome.finished_byte());
     debug_assert_eq!(packet.len(), CONNECT_LEN);
     packet
 }
@@ -517,33 +880,39 @@ impl std::fmt::Display for NamedInitRefusal {
 /// names itself with. Legacy `parse` remains available to existing
 /// single-title embedders. A routing name is a claim, not authentication.
 ///
-/// **The protocol version is not a gate here.** [`parse`] ignores it, and so
-/// does this: what a routing name needs is the body *layout*, and the checks
-/// below validate that directly — a complete local address, then a
-/// NUL-terminated name of permitted characters that is the datagram's last
-/// field. A datagram whose layout differs fails those checks and is refused
-/// with the reason, which is strictly more informative than refusing every
-/// version but one. Only version 4's layout is evidenced in this project;
-/// gating on it as well would reject other generations without ever reading
-/// whether their body agrees.
+/// **The protocol version is a gate here, as of 0.1.3**, because [`parse`] now
+/// checks it: a datagram must claim a version in [`Version::SUPPORTED`]. Both
+/// versions share this body layout exactly, so the layout checks below still
+/// do the real work — a complete local address, then a NUL-terminated name of
+/// permitted characters that is the datagram's last field — and a refusal
+/// still names the check that refused it, including the version. Use
+/// [`parse_named_init_accepting`] to narrow the gate to one version.
 pub fn parse_named_init(datagram: &[u8]) -> Option<(Init, &str)> {
     parse_named_init_detailed(datagram).ok()
 }
 
-/// [`parse_named_init`], but saying which check refused the datagram.
-///
-/// Same acceptance rule; only the failure is described. Use this where a
-/// refusal has to be recorded rather than counted.
-pub fn parse_named_init_detailed(datagram: &[u8]) -> Result<(Init, &str), NamedInitRefusal> {
+/// [`parse_named_init_detailed`] restricted to the versions a deployment
+/// serves. A packet in another version is refused as
+/// [`NamedInitRefusal::NotInit`] carrying
+/// [`NatNegError::UnsupportedVersion`].
+pub fn parse_named_init_accepting<'a>(
+    datagram: &'a [u8],
+    accepted: &'static [Version],
+) -> Result<(Init, &'a str), NamedInitRefusal> {
     if datagram.len() < 23 {
         return Err(NamedInitRefusal::TooShort(datagram.len()));
     }
-    let parsed = parse(datagram).map_err(NamedInitRefusal::NotInit)?;
+    let parsed = parse_accepting(datagram, accepted).map_err(NamedInitRefusal::NotInit)?;
     let Packet::Init(init) = parsed else {
         return Err(NamedInitRefusal::NotInit(NatNegError::UnhandledType(
             datagram[7],
         )));
     };
+    Ok((init, routing_name(datagram)?))
+}
+
+/// The NUL-terminated title name an INIT carries after its body, validated.
+fn routing_name(datagram: &[u8]) -> Result<&str, NamedInitRefusal> {
     let tail = &datagram[21..];
     let end = tail
         .iter()
@@ -565,5 +934,13 @@ pub fn parse_named_init_detailed(datagram: &[u8]) -> Result<(Init, &str), NamedI
     {
         return Err(NamedInitRefusal::DisallowedCharacter(character));
     }
-    Ok((init, name))
+    Ok(name)
+}
+
+/// [`parse_named_init`], but saying which check refused the datagram.
+///
+/// Same acceptance rule; only the failure is described. Use this where a
+/// refusal has to be recorded rather than counted.
+pub fn parse_named_init_detailed(datagram: &[u8]) -> Result<(Init, &str), NamedInitRefusal> {
+    parse_named_init_accepting(datagram, &Version::SUPPORTED)
 }

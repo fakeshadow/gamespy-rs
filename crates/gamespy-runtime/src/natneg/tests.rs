@@ -1,6 +1,58 @@
 use super::*;
 
 #[test]
+fn pinned_index_cannot_be_claimed_by_another_host() {
+    let mut pending = Pending::new(Policy::v3_compatible());
+    let mut first = side(1, 0);
+    first.version = Version::V3;
+    pending.accept_init("test", 7, &first).unwrap();
+    let mut impostor = first.clone();
+    impostor.address = SocketAddr::from(([10, 0, 0, 2], 7777));
+    assert!(pending.accept_init("test", 7, &impostor).is_err());
+    assert_eq!(pending.negotiations[&("test".into(), 7)].sides.len(), 1);
+}
+
+/// A sweep runs every few seconds, so an expired side can still be in the
+/// registry when an init arrives. Pairing already ignores one that old, and
+/// admission has to ignore it too: refusing the index its abandoned
+/// predecessor held would lock a live peer out until the next sweep.
+#[test]
+fn an_expired_side_does_not_keep_its_pinned_index() {
+    let mut pending = Pending::new(Policy::v3_compatible());
+    let mut gone = side(1, 0);
+    gone.version = Version::V3;
+    pending.accept_init("test", 7, &gone).unwrap();
+
+    let mut successor = gone.clone();
+    successor.address = SocketAddr::from(([10, 0, 0, 2], 7777));
+    successor.seen = gone.seen + PENDING_TTL + Duration::from_secs(1);
+    let recorded = pending
+        .accept_init("test", 7, &successor)
+        .expect("the index is free once its holder has expired");
+    assert_eq!(recorded.current.address, successor.address);
+    assert_eq!(
+        pending.negotiations[&("test".into(), 7)].sides.len(),
+        1,
+        "the expired side is gone, not kept alongside its successor"
+    );
+}
+
+#[test]
+fn late_placeholder_does_not_erase_a_usable_private_address() {
+    let mut pending = Pending::new(Policy::v3_compatible());
+    let mut first = side(1, 0);
+    first.version = Version::V3;
+    first.port_type = 3;
+    first.local_address = Some("192.168.1.10:3658".parse().unwrap());
+    pending.accept_init("test", 7, &first).unwrap();
+    let mut late = first.clone();
+    late.port_type = 1;
+    late.local_address = Some("0.0.0.0:0".parse().unwrap());
+    let recorded = pending.accept_init("test", 7, &late).unwrap();
+    assert_eq!(usable_local(&recorded.current), first.local_address);
+}
+
+#[test]
 fn title_scopes_survive_cookie_collisions_retries_and_expiry() {
     let mut pending = Pending::default();
     let first = side(1, 0);
@@ -40,7 +92,7 @@ fn title_scopes_survive_cookie_collisions_retries_and_expiry() {
         second.address
     );
     pending.sweep(Instant::now() + PENDING_TTL + Duration::from_secs(1));
-    assert!(pending.sides.is_empty());
+    assert!(pending.negotiations.is_empty());
     assert!(
         pending
             .record_scoped("alpha", 7, side(3, 1))
@@ -54,6 +106,7 @@ fn side(last: u8, index: u8) -> Side {
     Side {
         address: SocketAddr::from(([10, 0, 0, last], 7777)),
         client_index: index,
+        version: Version::V4,
         seen: now,
         port_type: 0,
         mappings: BTreeMap::new(),
@@ -150,7 +203,10 @@ fn a_repeated_init_from_one_side_is_not_a_second_peer() {
         pending.record(0x1234, side(220, 0)).is_none(),
         "the same console is still only one side"
     );
-    assert_eq!(pending.sides[&(String::new(), 0x1234)].len(), 1);
+    assert_eq!(
+        pending.negotiations[&(String::new(), 0x1234)].sides.len(),
+        1
+    );
 }
 
 /// Two consoles behind one NAT share a public address and are told apart
@@ -179,7 +235,7 @@ fn negotiations_are_kept_apart_by_cookie() {
         pending.record(0x2222, side(221, 1)).is_none(),
         "a different cookie is a different negotiation"
     );
-    assert_eq!(pending.sides.len(), 2);
+    assert_eq!(pending.negotiations.len(), 2);
 }
 
 #[test]
@@ -188,7 +244,7 @@ fn a_half_finished_negotiation_expires() {
     pending.record(0x1234, side(220, 0));
     let later = Instant::now() + PENDING_TTL + Duration::from_secs(1);
     assert_eq!(pending.sweep(later), vec![0x1234]);
-    assert!(pending.sides.is_empty());
+    assert!(pending.negotiations.is_empty());
 }
 
 #[test]
@@ -209,11 +265,14 @@ fn an_expired_peer_is_not_introduced_between_sweeps() {
     pending.record(0x1234, first);
 
     assert!(pending.record(0x1234, second).is_none());
-    assert_eq!(pending.sides[&(String::new(), 0x1234)].len(), 1);
+    assert_eq!(
+        pending.negotiations[&(String::new(), 0x1234)].sides.len(),
+        1
+    );
 
     // A later resend of the first peer can pair with the fresh second peer.
     let mut resend = side(220, 0);
-    resend.seen = pending.sides[&(String::new(), 0x1234)][&SideKey {
+    resend.seen = pending.negotiations[&(String::new(), 0x1234)].sides[&SideKey {
         client_index: 1,
         host: IpAddr::from([10, 0, 0, 221]),
     }]
@@ -432,7 +491,7 @@ fn two_peers_under_one_client_index_still_pair() {
         .expect("a second host must pair even when it claims the same index");
     assert_eq!(partner.address, first.address);
     assert_eq!(
-        pending.sides[&(String::new(), 0x1234)].len(),
+        pending.negotiations[&(String::new(), 0x1234)].sides.len(),
         2,
         "neither peer displaces the other"
     );
@@ -470,7 +529,10 @@ fn one_host_resending_from_many_ports_stays_a_single_side() {
             "port {port} must not look like a second peer"
         );
     }
-    assert_eq!(pending.sides[&(String::new(), 0x1234)].len(), 1);
+    assert_eq!(
+        pending.negotiations[&(String::new(), 0x1234)].sides.len(),
+        1
+    );
 }
 
 #[test]
@@ -721,10 +783,19 @@ fn every_refused_named_init_says_which_check_refused_it() {
 
 /// A service with no title routing, for exercising `introduce` directly.
 fn harness<O: crate::observe::Observer>(sockets: Vec<UdpSocket>, observer: O) -> Shared<O> {
+    harness_with(sockets, observer, Policy::default())
+}
+
+/// [`harness`] under a chosen policy.
+fn harness_with<O: crate::observe::Observer>(
+    sockets: Vec<UdpSocket>,
+    observer: O,
+    policy: Policy,
+) -> Shared<O> {
     Shared {
-        pending: std::sync::Mutex::new(Pending::default()),
+        pending: std::sync::Mutex::new(Pending::new(policy.clone())),
         observer,
-        names: None,
+        policy,
         sockets,
     }
 }
@@ -1198,9 +1269,9 @@ fn connect_resends_are_bounded_and_claimed_once() {
     }
     assert_eq!(sent, CONNECT_ATTEMPTS, "resends stop at the budget");
     let last = pending
-        .sides
+        .negotiations
         .values()
-        .flat_map(|sides| sides.values())
+        .flat_map(|negotiation| negotiation.sides.values())
         .next()
         .and_then(|side| side.connect.clone())
         .unwrap();
@@ -1317,4 +1388,855 @@ fn a_failure_report_is_acknowledged_and_recorded_as_a_failure() {
     assert!(trace.contains("result=failure"), "{trace}");
     assert!(trace.contains("game_name=absent"), "{trace}");
     drop(listener);
+}
+
+// ---------------------------------------------------------------------------
+// Version coexistence and the policies that are not derived from the version.
+//
+// The deterministic tests below drive the shared engine directly with an
+// injected `Instant`, so retries, partner timeouts and expiry are exact rather
+// than slept through. The loopback tests that follow check the bytes that
+// actually leave a socket. Every identifier and address here is synthetic.
+// ---------------------------------------------------------------------------
+
+/// A side announcing a chosen version.
+fn versioned_side(last: u8, index: u8, version: Version) -> Side {
+    let mut side = side(last, index);
+    side.version = version;
+    side
+}
+
+/// One registry, two negotiations in different generations, neither aware of
+/// the other. This is what "runtime coexistence" has to mean before any of the
+/// per-version encoding matters.
+#[test]
+fn independent_v3_and_v4_negotiations_share_one_registry() {
+    let mut pending = Pending::new(Policy::default().accepting(BOTH_VERSIONS));
+    for (cookie, version) in [(0x3333u32, Version::V3), (0x4444, Version::V4)] {
+        let first = versioned_side(10, 0, version);
+        let second = versioned_side(20, 1, version);
+        assert!(
+            pending
+                .accept_init("", cookie, &first)
+                .unwrap()
+                .partner
+                .is_none(),
+            "version {version} first side has nobody to pair with yet"
+        );
+        let recorded = pending.accept_init("", cookie, &second).unwrap();
+        let partner = recorded.partner.expect("the first side is the partner");
+        assert_eq!(partner.address, first.address);
+        assert_eq!(partner.version, version, "the partner's own version");
+        assert_eq!(recorded.current.version, version);
+        assert!(recorded.version_mismatch.is_none());
+    }
+    assert_eq!(pending.negotiations.len(), 2);
+}
+
+/// Serving both generations on one listener is not evidence that a version 3
+/// console and a version 4 console can play together, so such a pair is not
+/// introduced — and the refusal is recorded, because to the two peers it looks
+/// exactly like a partner that never arrived.
+#[test]
+fn a_mixed_version_pair_is_refused_unless_the_deployment_asks_for_it() {
+    let v3 = versioned_side(10, 0, Version::V3);
+    let v4 = versioned_side(20, 1, Version::V4);
+
+    let mut refusing = Pending::new(Policy::default());
+    assert!(!refusing.policy.pair_across_versions);
+    refusing.accept_init("", 7, &v3).unwrap();
+    let recorded = refusing.accept_init("", 7, &v4).unwrap();
+    assert!(
+        recorded.partner.is_none(),
+        "a version 3 side is not a partner for a version 4 side"
+    );
+    assert_eq!(recorded.version_mismatch, Some((0, Version::V3)));
+    let anomaly = Anomaly::MixedVersionPair {
+        this_side: (1, Version::V4),
+        other_side: (0, Version::V3),
+        paired: false,
+    };
+    assert!(anomaly.to_string().contains("not introduced"), "{anomaly}");
+
+    let mut pairing = Pending::new(Policy {
+        pair_across_versions: true,
+        ..Policy::default()
+    });
+    pairing.accept_init("", 7, &v3).unwrap();
+    let recorded = pairing.accept_init("", 7, &v4).unwrap();
+    assert_eq!(
+        recorded.partner.map(|partner| partner.version),
+        Some(Version::V3),
+        "the deployment asked for it, so the pair is introduced"
+    );
+    assert!(recorded.version_mismatch.is_none());
+}
+
+/// A participant whose version changes is a different client, not a resend of
+/// the one already held. Overwriting in place would hide that, and the INIT is
+/// not acknowledged — so the peer keeps resending rather than being told its
+/// retry loop is over for a negotiation this service did not record.
+#[test]
+fn a_side_that_changes_version_mid_negotiation_is_refused() {
+    let mut pending = Pending::new(Policy::default());
+    let mut peer = versioned_side(10, 0, Version::V3);
+    pending.accept_init("", 7, &peer).unwrap();
+
+    peer.version = Version::V4;
+    let refusal = pending.accept_init("", 7, &peer).expect_err("a new client");
+    assert_eq!(
+        refusal,
+        InitRefusal::VersionChanged {
+            held: Version::V3,
+            announced: Version::V4,
+        }
+    );
+    assert!(refusal.to_string().contains("not a resend"), "{refusal}");
+
+    // The held side is untouched, so the original client can still complete.
+    peer.version = Version::V3;
+    assert!(pending.accept_init("", 7, &peer).is_ok());
+    assert_eq!(
+        pending.negotiations[&(String::new(), 7)].sides.len(),
+        1,
+        "the refusal created nothing"
+    );
+}
+
+/// Pending state is bounded. A new cookie is refused at the limit; a cookie
+/// already held is never disturbed by the bound, because evicting a
+/// negotiation in progress to admit an unknown one is strictly worse.
+#[test]
+fn a_full_registry_refuses_new_cookies_and_keeps_the_ones_it_holds() {
+    let mut pending = Pending::new(Policy {
+        max_negotiations: 2,
+        ..Policy::default()
+    });
+    for cookie in 0..2u32 {
+        pending
+            .accept_init("", cookie, &side(10, 0))
+            .expect("inside the bound");
+    }
+    let refusal = pending
+        .accept_init("", 99, &side(11, 0))
+        .expect_err("the registry is full");
+    assert_eq!(refusal, InitRefusal::Capacity { held: 2, limit: 2 });
+    assert!(
+        refusal.to_string().contains("rather than evicting"),
+        "{refusal}"
+    );
+    // Both held negotiations still accept inits, including a second side.
+    for cookie in 0..2u32 {
+        assert!(pending.accept_init("", cookie, &side(10, 0)).is_ok());
+        assert!(
+            pending
+                .accept_init("", cookie, &side(20, 1))
+                .unwrap()
+                .partner
+                .is_some()
+        );
+    }
+    assert_eq!(pending.negotiations.len(), 2);
+    // Capacity is per title cookie space, and a title's name is part of the
+    // key, so a second title cannot borrow room from the first.
+    assert!(pending.accept_init("other", 0, &side(10, 0)).is_err());
+}
+
+/// A lone side is told once that no partner arrived, and the cookie is then
+/// closed: the peer has already reported the failure to its title, so a late
+/// partner must not be introduced to a console that has given up.
+#[test]
+fn a_lone_side_is_told_no_partner_arrived_exactly_once() {
+    let wait = Duration::from_secs(30);
+    let mut pending = Pending::new(Policy {
+        partner_wait: Some(wait),
+        ..Policy::default()
+    });
+    let lone = side(10, 0);
+    let start = lone.seen;
+    pending.accept_init("alpha", 7, &lone).unwrap();
+
+    assert!(
+        pending
+            .expired_partners(start + wait - Duration::from_millis(1))
+            .is_empty(),
+        "not yet"
+    );
+    let failed = pending.expired_partners(start + wait);
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].title, "alpha");
+    assert_eq!(failed[0].cookie, 7);
+    assert_eq!(failed[0].client_index, 0);
+    assert_eq!(failed[0].version, Version::V4);
+    assert_eq!(failed[0].target, lone.address);
+    assert_eq!(failed[0].waited, wait);
+
+    // Said once. There is no acknowledgement for a failure CONNECT, so there
+    // is nothing to retry towards.
+    assert!(
+        pending.expired_partners(start + wait * 2).is_empty(),
+        "a failure connect is not retried"
+    );
+    // And the cookie is closed to later inits, from either side.
+    assert_eq!(
+        pending.accept_init("alpha", 7, &side(20, 1)).err(),
+        Some(InitRefusal::Abandoned)
+    );
+    assert_eq!(
+        pending.accept_init("alpha", 7, &lone).err(),
+        Some(InitRefusal::Abandoned)
+    );
+    // No connect of any kind follows for an abandoned cookie.
+    assert!(pending.due_connects(start + wait * 2).is_empty());
+}
+
+/// A negotiation that has both sides never fails this way, even if one side is
+/// not yet ready: this service has no evidence that the missing registration
+/// is never coming, and a failure CONNECT cannot be taken back.
+#[test]
+fn a_pair_that_is_merely_unready_is_not_abandoned() {
+    let wait = Duration::from_secs(30);
+    let mut pending = Pending::new(Policy {
+        partner_wait: Some(wait),
+        readiness: Readiness::AllRegistrations,
+        ..Policy::default()
+    });
+    let first = side(10, 0);
+    let start = first.seen;
+    pending.accept_init("", 7, &first).unwrap();
+    pending.accept_init("", 7, &side(20, 1)).unwrap();
+    assert!(pending.expired_partners(start + wait).is_empty());
+    assert!(!pending.negotiations[&(String::new(), 7)].abandoned);
+}
+
+/// Without a configured wait nothing is sent, which is what an existing
+/// embedder sees: upgrading introduces no new packet type.
+#[test]
+fn a_partner_timeout_is_off_unless_configured() {
+    let mut pending = Pending::default();
+    assert!(pending.policy.partner_wait.is_none());
+    let lone = side(10, 0);
+    let start = lone.seen;
+    pending.accept_init("", 7, &lone).unwrap();
+    assert!(
+        pending
+            .expired_partners(start + Duration::from_secs(3600))
+            .is_empty()
+    );
+    assert!(!pending.negotiations[&(String::new(), 7)].abandoned);
+}
+
+/// Source rebinding is a decision, not something inherited from whichever
+/// pairing rule happened to be permissive.
+#[test]
+fn the_rebinding_policy_decides_whether_a_moved_source_is_followed() {
+    let first = side(10, 0);
+    let mut moved = first.clone();
+    moved.address = SocketAddr::new(first.address.ip(), 50001);
+
+    // Follow: the new address becomes the mapping, and the move is reported
+    // as an anomaly rather than passed over.
+    let mut following = Pending::new(Policy::default());
+    following.accept_init("", 7, &first).unwrap();
+    let recorded = following.accept_init("", 7, &moved).unwrap();
+    assert_eq!(recorded.current.address, moved.address);
+    let reported = anomalies(recorded.replaced.as_ref().unwrap(), &recorded.current);
+    assert!(
+        matches!(reported.as_slice(), [Anomaly::Rebound { .. }]),
+        "{reported:?}"
+    );
+
+    // Pin: the first address for that port type stands, and the init is
+    // refused rather than acknowledged.
+    let mut pinning = Pending::new(Policy {
+        rebinding: Rebinding::Pin,
+        ..Policy::default()
+    });
+    pinning.accept_init("", 7, &first).unwrap();
+    assert_eq!(
+        pinning.accept_init("", 7, &moved).err(),
+        Some(InitRefusal::SourcePinned {
+            port_type: 0,
+            held: first.address,
+            announced: moved.address,
+        })
+    );
+    assert_eq!(
+        pinning.negotiations[&(String::new(), 7)].sides[&SideKey::of(&first)].address,
+        first.address
+    );
+    // An unchanged resend is still a resend under Pin.
+    assert!(pinning.accept_init("", 7, &first).is_ok());
+    // A different port type from a new address is a new mapping, not a move.
+    let mut other_type = moved.clone();
+    other_type.port_type = natneg::port_type::NEGOTIATION_2;
+    assert!(pinning.accept_init("", 7, &other_type).is_ok());
+
+    // Pin also refuses a changed usegameport, because it changes which of the
+    // peer's sockets a partner would be told to punch.
+    let mut flipped = first.clone();
+    flipped.use_game_port = !first.use_game_port;
+    assert_eq!(
+        pinning.accept_init("", 7, &flipped).err(),
+        Some(InitRefusal::GamePortChanged {
+            held: first.use_game_port,
+            announced: flipped.use_game_port,
+        })
+    );
+}
+
+/// The readiness rule the v3 consumer established: all three negotiation
+/// registrations, plus the game port when the peer asked for one.
+#[test]
+fn readiness_requires_every_registration_the_peer_will_use() {
+    let mut partial = side(10, 0);
+    partial.use_game_port = true;
+    partial
+        .mappings
+        .insert(natneg::port_type::NEGOTIATION_1, partial.address);
+    assert!(
+        is_ready(&partial, Readiness::OnFirstInit),
+        "the default introduces from the first init"
+    );
+    assert!(!is_ready(&partial, Readiness::AllRegistrations));
+    assert_eq!(
+        missing_registrations(&partial),
+        vec![
+            natneg::port_type::GAME,
+            natneg::port_type::NEGOTIATION_2,
+            natneg::port_type::NEGOTIATION_3
+        ]
+    );
+
+    for port_type in [
+        natneg::port_type::NEGOTIATION_2,
+        natneg::port_type::NEGOTIATION_3,
+    ] {
+        partial.mappings.insert(port_type, partial.address);
+    }
+    // Still short of the game port it said it would use.
+    assert!(!is_ready(&partial, Readiness::AllRegistrations));
+    assert_eq!(
+        missing_registrations(&partial),
+        vec![natneg::port_type::GAME]
+    );
+    partial
+        .mappings
+        .insert(natneg::port_type::GAME, partial.address);
+    assert!(is_ready(&partial, Readiness::AllRegistrations));
+    assert!(missing_registrations(&partial).is_empty());
+
+    // A peer that negotiates without a game socket is ready on the three
+    // negotiation probes alone, exactly as the SDK's own condition is.
+    let mut no_game_port = side(11, 1);
+    no_game_port.use_game_port = false;
+    for port_type in natneg::port_type::NEGOTIATION_1..=natneg::port_type::NEGOTIATION_3 {
+        no_game_port
+            .mappings
+            .insert(port_type, no_game_port.address);
+    }
+    assert!(is_ready(&no_game_port, Readiness::AllRegistrations));
+    assert!(missing_registrations(&no_game_port).is_empty());
+}
+
+/// Gameplay and control mappings are tracked apart, and a CONNECT is
+/// delivered to the control endpoint while advertising the gameplay one.
+#[test]
+fn a_connect_goes_to_the_control_mapping_and_advertises_the_game_mapping() {
+    let host: IpAddr = [10, 0, 0, 10].into();
+    let game = SocketAddr::new(host, 3658);
+    let negotiate = SocketAddr::new(host, 50000);
+
+    let mut peer = side(10, 0);
+    peer.use_game_port = true;
+    peer.address = negotiate;
+    peer.mappings.insert(natneg::port_type::GAME, game);
+    peer.mappings
+        .insert(natneg::port_type::NEGOTIATION_1, negotiate);
+    // The latest init happened to be the game port's.
+    peer.address = game;
+    peer.port_type = natneg::port_type::GAME;
+
+    assert_eq!(control_endpoint(&peer, ControlEndpoint::LatestInit), game);
+    assert_eq!(
+        control_endpoint(&peer, ControlEndpoint::NegotiationMapping),
+        negotiate,
+        "control traffic belongs on the socket the negotiation state machine owns"
+    );
+    // What a partner is told to punch is a separate question, and is the
+    // game port either way.
+    assert_eq!(advertised_mapping(&peer), game);
+
+    // A side that announced no NN1 mapping falls back to its latest init
+    // rather than having nowhere to be reached.
+    let bare = side(11, 1);
+    assert_eq!(
+        control_endpoint(&bare, ControlEndpoint::NegotiationMapping),
+        bare.address
+    );
+
+    // And the retry pass sends to the configured endpoint, not to whichever
+    // init arrived last.
+    let mut pending = Pending::new(Policy {
+        control_endpoint: ControlEndpoint::NegotiationMapping,
+        ..Policy::default()
+    });
+    let now = peer.seen;
+    pending.accept_init("", 7, &peer).unwrap();
+    let key = SideKey::of(&peer);
+    let partner = SocketAddrV4::new([203, 0, 113, 9].into(), 3658);
+    assert!(pending.arm_connect("", 7, key, partner, now));
+    let due = pending.due_connects(now + CONNECT_RETRY);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].target, negotiate);
+    assert_eq!(due[0].partner, partner);
+}
+
+/// A CONNECT_ACK is honoured from any mapping its side announced, and from
+/// nowhere else. Both halves matter: under
+/// [`ControlEndpoint::NegotiationMapping`] the acknowledgement deliberately
+/// arrives from an address that is not the latest init's source, while an
+/// acknowledgement from an unrelated address must settle nothing.
+#[test]
+fn a_connect_ack_is_bound_to_the_sources_its_side_announced() {
+    let host: IpAddr = [10, 0, 0, 10].into();
+    let game = SocketAddr::new(host, 3658);
+    let negotiate = SocketAddr::new(host, 50000);
+    let partner = SocketAddrV4::new([203, 0, 113, 9].into(), 3658);
+
+    let mut pending = Pending::new(Policy::default());
+    let mut peer = side(10, 0);
+    peer.address = negotiate;
+    peer.port_type = natneg::port_type::NEGOTIATION_1;
+    let now = peer.seen;
+    pending.accept_init("", 7, &peer).unwrap();
+    peer.address = game;
+    peer.port_type = natneg::port_type::GAME;
+    pending.accept_init("", 7, &peer).unwrap();
+    assert!(pending.arm_connect("", 7, SideKey::of(&peer), partner, now));
+
+    // An unrelated source: right cookie, wrong address. Nothing is settled.
+    let stranger = SocketAddr::new([198, 51, 100, 7].into(), 50000);
+    assert!(pending.acknowledge_connect(7, stranger, now).is_empty());
+    // A different cookie from the real peer settles nothing either.
+    assert!(pending.acknowledge_connect(8, negotiate, now).is_empty());
+    assert_eq!(
+        pending.due_connects(now + CONNECT_RETRY).len(),
+        1,
+        "neither of those stopped the resends"
+    );
+
+    // The negotiation mapping, which is not this side's latest init source.
+    let acked = pending.acknowledge_connect(7, negotiate, now + CONNECT_RETRY);
+    assert_eq!(acked.len(), 1);
+    assert!(!acked[0].repeated);
+    assert_eq!(acked[0].partner, partner);
+    assert!(
+        pending.due_connects(now + CONNECT_RETRY * 4).is_empty(),
+        "an acknowledged connect is not resent"
+    );
+    // A duplicate acknowledgement is reported as one and changes nothing.
+    let again = pending.acknowledge_connect(7, game, now + CONNECT_RETRY * 2);
+    assert_eq!(again.len(), 1);
+    assert!(again[0].repeated);
+}
+
+/// A full registration sequence in each generation, out of order, with a
+/// duplicate and a missing registration, driven through the engine.
+#[test]
+fn registrations_may_arrive_out_of_order_and_repeat() {
+    let mut pending = Pending::new(Policy {
+        readiness: Readiness::AllRegistrations,
+        ..Policy::default()
+    });
+    let mut peer = versioned_side(10, 0, Version::V3);
+    peer.use_game_port = true;
+    // Backwards, with the second probe repeated.
+    for port_type in [3u8, 2, 2, 1] {
+        peer.port_type = port_type;
+        let recorded = pending.accept_init("", 7, &peer).unwrap();
+        assert!(
+            !is_ready(&recorded.current, Readiness::AllRegistrations),
+            "the game port it asked for has not arrived"
+        );
+    }
+    peer.port_type = natneg::port_type::GAME;
+    let recorded = pending.accept_init("", 7, &peer).unwrap();
+    assert!(is_ready(&recorded.current, Readiness::AllRegistrations));
+    assert_eq!(recorded.current.inits, 5, "every init counts, repeats too");
+    assert_eq!(recorded.current.mappings.len(), 4);
+}
+
+// --- loopback transport -----------------------------------------------------
+
+/// An init in a chosen version and port type, with a title name appended.
+fn versioned_named_init(
+    version: Version,
+    cookie: u32,
+    index: u8,
+    port_type: u8,
+    title: &str,
+) -> Vec<u8> {
+    let mut packet = natneg::MAGIC.to_vec();
+    packet.extend_from_slice(&[version.as_byte(), natneg::packet_type::INIT]);
+    packet.extend_from_slice(&cookie.to_be_bytes());
+    packet.extend_from_slice(&[port_type, index, 1]);
+    packet.extend_from_slice(&[192, 168, 1, 50 + index]);
+    packet.extend_from_slice(&7777u16.to_be_bytes());
+    packet.extend_from_slice(title.as_bytes());
+    packet.push(0);
+    packet
+}
+
+/// Announce every port type from one socket and return the last init's bytes.
+fn announce_all(
+    peer: &UdpSocket,
+    service: SocketAddr,
+    version: Version,
+    cookie: u32,
+    index: u8,
+    title: &str,
+) {
+    for port_type in natneg::port_type::GAME..=natneg::port_type::NEGOTIATION_3 {
+        let init = versioned_named_init(version, cookie, index, port_type, title);
+        peer.send_to(&init, service).unwrap();
+        let ack = recv(peer, "an init_ack");
+        assert_eq!(ack[7], natneg::packet_type::INIT_ACK);
+        assert_eq!(ack[6], version.as_byte(), "answered in the peer's version");
+        assert_eq!(ack[12], port_type, "the port type it ticks off");
+        assert_eq!(ack.len(), natneg::INIT_WITH_ADDRESS_LEN);
+    }
+}
+
+/// One listener, one registry, two negotiations in different generations
+/// completing without touching each other. This is the result the task is
+/// for: runtime coexistence, with the version retained per participant.
+#[test]
+fn one_listener_serves_a_v3_and_a_v4_negotiation_side_by_side() {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let service = socket.local_addr().unwrap();
+    let capture = Capture::default();
+    let listener = spawn_with_policy(
+        socket,
+        capture.clone(),
+        Policy::v3_compatible()
+            .accepting(BOTH_VERSIONS)
+            .with_titles(vec!["synthetictitle".into()])
+            .with_partner_wait(None),
+    )
+    .unwrap();
+
+    for (cookie, version) in [(0x3333u32, Version::V3), (0x4444, Version::V4)] {
+        let one = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let two = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for peer in [&one, &two] {
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        }
+        announce_all(&one, service, version, cookie, 0, "synthetictitle");
+        announce_all(&two, service, version, cookie, 1, "synthetictitle");
+
+        // Each peer is told where the *other* one is. Both reach this
+        // service from 127.0.0.1, so they are behind one address as far as
+        // this service can tell, and each is handed its partner's announced
+        // private address rather than a public one needing hairpinning.
+        for (peer, partner_host) in [(&one, 51u8), (&two, 50)] {
+            let connect = recv_connect(peer);
+            assert_eq!(connect.len(), natneg::CONNECT_LEN);
+            assert_eq!(
+                connect[6],
+                version.as_byte(),
+                "a connect is encoded in its recipient's version, not this build's"
+            );
+            assert_eq!(connect[7], natneg::packet_type::CONNECT);
+            assert_eq!(&connect[8..12], &cookie.to_be_bytes());
+            assert_eq!(
+                connect[natneg::CONNECT_LEN - 1],
+                natneg::finished::NO_ERROR,
+                "a successful introduction, which is the only kind a client acknowledges"
+            );
+            assert_eq!(&connect[12..16], &[192, 168, 1, partner_host]);
+            assert_eq!(u16::from_be_bytes([connect[16], connect[17]]), 7777);
+        }
+    }
+
+    // Nothing crossed over: each cookie was brokered in its own version.
+    assert!(
+        capture
+            .find_soon("anomaly: index")
+            .is_none_or(|line| !line.contains("protocol version")),
+        "no mixed-version pairing was attempted: {:?}",
+        capture.find("anomaly: index")
+    );
+    listener.shutdown().unwrap();
+}
+
+/// A version this listener was not configured to accept is refused with the
+/// byte it sent, and — crucially — is **not** acknowledged: an init_ack would
+/// end the peer's retry loop for a negotiation this service never recorded.
+#[test]
+fn an_unaccepted_version_is_refused_and_never_acknowledged() {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let service = socket.local_addr().unwrap();
+    let capture = Capture::default();
+    let listener = spawn_with_policy(
+        socket,
+        capture.clone(),
+        Policy::v3_compatible().with_partner_wait(None),
+    )
+    .unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+    // Version 4 is a generation this crate serves, but not one this
+    // deployment accepts.
+    let mut v4 = versioned_named_init(Version::V4, 0x4444, 0, 1, "synthetictitle");
+    v4.truncate(21);
+    peer.send_to(&v4, service).unwrap();
+    expect_silence(
+        &peer,
+        Duration::from_millis(400),
+        "a version this listener does not accept is not answered",
+    );
+    let refusal = capture
+        .find_soon("not accepted by this deployment")
+        .expect("the refusal names the version and what is accepted");
+    assert!(refusal.contains("version 4"), "{refusal}");
+
+    // And a generation nothing has evidence for.
+    let mut unknown = v4.clone();
+    unknown[6] = 9;
+    peer.send_to(&unknown, service).unwrap();
+    expect_silence(
+        &peer,
+        Duration::from_millis(400),
+        "an unknown generation is not answered either",
+    );
+
+    // The accepted version still works on the same listener.
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let v3 = versioned_named_init(Version::V3, 0x3333, 0, 1, "synthetictitle");
+    peer.send_to(&v3, service).unwrap();
+    let ack = recv(&peer, "an init_ack for the accepted version");
+    assert_eq!(ack[6], 3);
+    assert_eq!(ack[7], natneg::packet_type::INIT_ACK);
+    listener.shutdown().unwrap();
+}
+
+/// The exact reply bytes a v3 deployment puts on the wire, which are the ones
+/// the mkvsdcu listener emits today: 21-byte acknowledgements with the fields
+/// set rather than the body echoed, and a 20-byte version 3 connect.
+#[test]
+fn a_v3_policy_emits_the_consumer_reply_shapes() {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let service = socket.local_addr().unwrap();
+    let capture = Capture::default();
+    let listener = spawn_with_policy(
+        socket,
+        capture.clone(),
+        Policy::v3_compatible()
+            .with_titles(vec!["synthetictitle".into()])
+            .with_partner_wait(Some(Duration::from_millis(250))),
+    )
+    .unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // INIT_ACK: the field-built 21 bytes, not the echo.
+    let init = versioned_named_init(Version::V3, 0x1234, 1, 3, "synthetictitle");
+    peer.send_to(&init, service).unwrap();
+    let ack = recv(&peer, "an init_ack");
+    assert_eq!(
+        ack,
+        natneg::init_ack_fields(Version::V3, 0x1234, 3, 1),
+        "the v3 policy builds an init_ack from fields"
+    );
+    assert_eq!(ack.len(), 21);
+    assert_eq!(&ack[14..], &[0u8; 7], "the echoed body bytes are zero here");
+
+    // The lone side is then told no partner arrived, once.
+    let failure = recv(&peer, "a deadbeat-partner connect");
+    assert_eq!(failure.len(), natneg::CONNECT_LEN);
+    assert_eq!(failure[6], 3);
+    assert_eq!(failure[7], natneg::packet_type::CONNECT);
+    assert_eq!(&failure[8..12], &0x1234u32.to_be_bytes());
+    assert_eq!(
+        failure[natneg::CONNECT_LEN - 1],
+        natneg::finished::DEADBEAT_PARTNER
+    );
+    assert_eq!(&failure[12..18], &[0, 0, 0, 0, 0, 0], "nothing to punch");
+    expect_silence(
+        &peer,
+        Duration::from_millis(600),
+        "a failure connect is never acknowledged, so it is sent once",
+    );
+    assert!(
+        capture
+            .find_soon("FINISHED_ERROR_DEADBEAT_PARTNER")
+            .is_some_and(|line| line.contains("closed to further inits")),
+        "the capture says the cookie is closed: {:?}",
+        capture.lines()
+    );
+
+    // REPORT_ACK: the 21-byte init-body shape, in version 3.
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut report = natneg::MAGIC.to_vec();
+    report.extend_from_slice(&[3, natneg::packet_type::REPORT]);
+    report.extend_from_slice(&0x5678u32.to_be_bytes());
+    report.resize(natneg::REPORT_LEN, 0);
+    report[13] = 1; // client index
+    report[14] = 1; // negResult: success
+    peer.send_to(&report, service).unwrap();
+    let report_ack = recv(&peer, "a report_ack");
+    let mut expected = natneg::init_ack_fields(Version::V3, 0x5678, 0, 1);
+    expected[7] = natneg::packet_type::REPORT_ACK;
+    assert_eq!(report_ack, expected);
+    assert_eq!(report_ack.len(), 21);
+    // Repeated reports are answered the same way, every time: the peer is in
+    // ns_reportsent until one of them lands.
+    for _ in 0..2 {
+        peer.send_to(&report, service).unwrap();
+        assert_eq!(recv(&peer, "a repeated report_ack"), expected);
+    }
+    listener.shutdown().unwrap();
+}
+
+/// The default policy's replies are unchanged, byte for byte: an existing
+/// version 4 embedder sees the same echoed shapes and no new packet type.
+#[test]
+fn the_default_policy_keeps_the_existing_v4_reply_shapes() {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let service = socket.local_addr().unwrap();
+    let listener = spawn_with_socket(socket, crate::observe::Noop).unwrap();
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let init = versioned_named_init(Version::V4, 0x1234, 0, 1, "ignored");
+    peer.send_to(&init, service).unwrap();
+    assert_eq!(
+        recv_init_ack(&peer, &init),
+        natneg::init_ack(&init).unwrap(),
+        "the echoed shape, as before"
+    );
+
+    let mut report = natneg::MAGIC.to_vec();
+    report.extend_from_slice(&[4, natneg::packet_type::REPORT]);
+    report.extend_from_slice(&0x1234u32.to_be_bytes());
+    report.resize(natneg::REPORT_LEN, 0);
+    peer.send_to(&report, service).unwrap();
+    let ack = recv(&peer, "a report_ack");
+    assert_eq!(ack, natneg::report_ack(&report).unwrap());
+    assert_eq!(ack.len(), natneg::REPORT_LEN, "73 bytes, as before");
+
+    // And no partner-timeout packet arrives, because the default sends none.
+    expect_silence(
+        &peer,
+        Duration::from_millis(400),
+        "the default policy introduces no new packet type",
+    );
+    listener.shutdown().unwrap();
+}
+
+/// A policy that cannot be served is refused at startup rather than halfway
+/// through a negotiation.
+#[test]
+fn an_unservable_policy_is_refused_at_startup() {
+    for (policy, expected) in [
+        (
+            Policy::default().accepting(&[]),
+            "at least one accepted protocol version",
+        ),
+        (
+            Policy {
+                max_negotiations: 0,
+                ..Policy::default()
+            },
+            "room for at least one negotiation",
+        ),
+        (Policy::default().with_titles(vec![]), "at least one title"),
+        (
+            Policy::default().with_titles(vec!["same".into(), "SAME".into()]),
+            "more than one route",
+        ),
+    ] {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let error = match spawn_with_policy(socket, crate::observe::Noop, policy) {
+            Ok(_) => panic!("an unservable policy must not start a listener"),
+            Err(error) => error,
+        };
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+/// The startup capability trace says what this build serves, including the
+/// version set and every policy that is not derived from it. A capture that
+/// does not say so cannot be read against the implementation.
+#[test]
+fn the_capability_trace_states_the_versions_and_policies() {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let capture = Capture::default();
+    let listener = spawn_with_policy(
+        socket,
+        capture.clone(),
+        Policy::v3_compatible().accepting(BOTH_VERSIONS),
+    )
+    .unwrap();
+    let trace = capture
+        .find("capability trace")
+        .expect("a capability trace on startup");
+    for needle in [
+        "protocol version(s) 3, 4",
+        "mixed-version pairing refused",
+        "Readiness AllRegistrations",
+        "connect delivered to NegotiationMapping",
+        "rebinding Pin",
+        "init_ack Fields",
+        "report_ack InitBody",
+        "partner wait 30000 ms",
+        "at most 1024 negotiations",
+    ] {
+        assert!(trace.contains(needle), "missing {needle:?} from {trace}");
+    }
+    listener.shutdown().unwrap();
+}
+
+/// A negotiation that was introduced and then lost a side to expiry is not
+/// told its partner never arrived: the surviving peer holds a CONNECT and may
+/// be punching, and a failure CONNECT cannot be taken back.
+#[test]
+fn an_introduced_side_left_alone_is_not_told_there_was_no_partner() {
+    let wait = Duration::from_secs(30);
+    let mut pending = Pending::new(Policy {
+        partner_wait: Some(wait),
+        ..Policy::default()
+    });
+    let first = side(10, 0);
+    let start = first.seen;
+    pending.accept_init("", 7, &first).unwrap();
+    let second = side(20, 1);
+    assert!(
+        pending
+            .accept_init("", 7, &second)
+            .unwrap()
+            .partner
+            .is_some()
+    );
+    // Both sides are armed with their introduction.
+    let partner = SocketAddrV4::new([203, 0, 113, 9].into(), 3658);
+    assert!(pending.arm_connect("", 7, SideKey::of(&first), partner, start));
+    assert!(pending.arm_connect("", 7, SideKey::of(&second), partner, start));
+
+    // The second side goes quiet and is swept, leaving one side behind.
+    let later = start + PENDING_TTL + Duration::from_secs(1);
+    pending
+        .negotiations
+        .get_mut(&(String::new(), 7))
+        .unwrap()
+        .sides
+        .remove(&SideKey::of(&second));
+    assert_eq!(pending.negotiations[&(String::new(), 7)].sides.len(), 1);
+
+    assert!(
+        pending.expired_partners(later).is_empty(),
+        "an introduced side is not told its partner never arrived"
+    );
+    assert!(!pending.negotiations[&(String::new(), 7)].abandoned);
 }

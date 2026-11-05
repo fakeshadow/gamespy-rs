@@ -10,15 +10,26 @@ fn named_init_requires_a_complete_supported_unambiguous_name() {
     for len in 0..packet.len() {
         assert!(parse_named_init(&packet[..len]).is_none());
     }
-    // The version byte is not a gate: the body layout is what a routing name
-    // depends on, and it is checked directly. An older SDK generation whose
-    // INIT agrees on that layout routes rather than being refused unread.
-    for version in [0, 2, 3, VERSION, 255] {
+    // Both supported generations share this body layout exactly, so both
+    // route, and the version each announced is carried through.
+    for version in Version::SUPPORTED {
+        let mut other = packet.clone();
+        other[6] = version.as_byte();
+        let (init, name) = parse_named_init(&other).expect("version {version} routes");
+        assert_eq!(name, "SyntheticTitle");
+        assert_eq!(init.version, version);
+    }
+    // A generation this crate has no evidence for is refused by name, not
+    // parsed on the assumption that its body agrees.
+    for version in [0u8, 1, 2, 5, 255] {
         let mut other = packet.clone();
         other[6] = version;
         assert_eq!(
-            parse_named_init(&other).map(|(_, name)| name),
-            Some("SyntheticTitle"),
+            parse_named_init_detailed(&other),
+            Err(NamedInitRefusal::NotInit(NatNegError::UnsupportedVersion {
+                version,
+                accepted: &Version::SUPPORTED,
+            })),
             "version {version}"
         );
     }
@@ -66,6 +77,7 @@ fn an_init_parses_into_its_cookie_and_index() {
     assert_eq!(
         parse(&packet),
         Ok(Packet::Init(Init {
+            version: Version::V4,
             cookie: 0xDEADBEEF,
             port_type: 2,
             client_index: 1,
@@ -307,7 +319,10 @@ fn defined_types_parse_and_only_unknown_ones_are_refused() {
     };
     assert_eq!(
         parse(&typed(packet_type::CONNECT_ACK)),
-        Ok(Packet::ConnectAck { cookie: 0xABCD })
+        Ok(Packet::ConnectAck {
+            version: Version::V4,
+            cookie: 0xABCD
+        })
     );
     for defined in [
         packet_type::CONNECT,
@@ -317,6 +332,7 @@ fn defined_types_parse_and_only_unknown_ones_are_refused() {
         assert_eq!(
             parse(&typed(defined)),
             Ok(Packet::Unacted {
+                version: Version::V4,
                 packet_type: defined,
                 cookie: 0xABCD,
             }),
@@ -327,6 +343,7 @@ fn defined_types_parse_and_only_unknown_ones_are_refused() {
         assert_eq!(
             parse(&typed(defined)),
             Ok(Packet::Unacted {
+                version: Version::V4,
                 packet_type: defined,
                 cookie: 0xABCD,
             }),
@@ -469,4 +486,276 @@ fn a_report_ack_echoes_the_report_with_only_the_type_changed() {
         &report[HEADER_LEN..HEADER_LEN + 3]
     );
     assert!(padded[HEADER_LEN + 3..].iter().all(|byte| *byte == 0));
+}
+
+// ---------------------------------------------------------------------------
+// Version handling and the v3 reply shapes.
+//
+// The byte vectors below are the ones the mkvsdcu v3 listener's own tests
+// assert, rebuilt here from synthetic cookies and addresses. They are what
+// makes "this crate can emit what that consumer emits" a checked claim rather
+// than a reading of two sources.
+// ---------------------------------------------------------------------------
+
+/// An init packet in a chosen version, otherwise [`init_packet`]'s layout.
+fn versioned_init(version: Version, cookie: u32, port_type: u8, client_index: u8) -> Vec<u8> {
+    let mut packet = init_packet(cookie, port_type, client_index);
+    packet[6] = version.as_byte();
+    packet
+}
+
+/// Both generations share one body layout, so one parser reads both and each
+/// decoded packet says which version it arrived in.
+#[test]
+fn both_versions_parse_identically_and_carry_their_own_version() {
+    for version in Version::SUPPORTED {
+        let init = versioned_init(version, 0xDEADBEEF, 2, 1);
+        assert_eq!(
+            parse(&init),
+            Ok(Packet::Init(Init {
+                version,
+                cookie: 0xDEADBEEF,
+                port_type: 2,
+                client_index: 1,
+                use_game_port: true,
+                local_address: Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 221), 7777)),
+            })),
+            "version {version} init"
+        );
+
+        let mut ack = init.clone();
+        ack[7] = packet_type::CONNECT_ACK;
+        assert_eq!(
+            parse(&ack),
+            Ok(Packet::ConnectAck {
+                version,
+                cookie: 0xDEADBEEF
+            })
+        );
+
+        let mut report = report_packet(0xDEADBEEF, true, Some("synthetic"));
+        report[6] = version.as_byte();
+        let Ok(Packet::Report(parsed)) = parse(&report) else {
+            panic!("version {version} report must parse");
+        };
+        assert_eq!(parsed.version, version);
+        assert_eq!(parsed.game_name.as_deref(), Some("synthetic"));
+
+        let mut unacted = init.clone();
+        unacted[7] = packet_type::CONNECT_PING;
+        assert_eq!(parse(&unacted).map(|packet| packet.version()), Ok(version));
+        assert_eq!(
+            parse(&unacted).map(|packet| packet.cookie()),
+            Ok(0xDEADBEEF)
+        );
+    }
+}
+
+/// A version this crate has no evidence for is refused with the byte it sent,
+/// so a capture can tell an unknown generation from a corrupt header.
+#[test]
+fn an_unsupported_version_is_refused_with_its_byte() {
+    for byte in [0u8, 1, 2, 5, 6, 0x80, 255] {
+        let mut packet = init_packet(1, 0, 0);
+        packet[6] = byte;
+        assert_eq!(
+            parse(&packet),
+            Err(NatNegError::UnsupportedVersion {
+                version: byte,
+                accepted: &Version::SUPPORTED,
+            }),
+            "version byte {byte}"
+        );
+        // Refused before the type byte is dispatched: an unserved version is
+        // not a packet to act on, whatever it claims to be.
+        packet[7] = packet_type::REPORT;
+        assert!(matches!(
+            parse(&packet),
+            Err(NatNegError::UnsupportedVersion { .. })
+        ));
+    }
+}
+
+/// A deployment that serves one generation refuses the other with a message
+/// that says so, rather than with the one about unknown generations.
+#[test]
+fn a_narrowed_version_set_refuses_the_other_generation_differently() {
+    const V3_ONLY: &[Version] = &[Version::V3];
+    const V4_ONLY: &[Version] = &[Version::V4];
+
+    let v4 = versioned_init(Version::V4, 1, 0, 0);
+    let refusal = parse_accepting(&v4, V3_ONLY).expect_err("v4 is not served here");
+    assert_eq!(
+        refusal,
+        NatNegError::UnsupportedVersion {
+            version: 4,
+            accepted: V3_ONLY
+        }
+    );
+    assert!(
+        refusal
+            .to_string()
+            .contains("not accepted by this deployment"),
+        "a deployment refusal reads differently from an unknown generation: {refusal}"
+    );
+    assert!(
+        NatNegError::UnsupportedVersion {
+            version: 9,
+            accepted: &Version::SUPPORTED
+        }
+        .to_string()
+        .contains("not a generation this crate serves")
+    );
+
+    let v3 = versioned_init(Version::V3, 1, 0, 0);
+    assert!(parse_accepting(&v3, V3_ONLY).is_ok());
+    assert!(parse_accepting(&v4, V4_ONLY).is_ok());
+    assert!(parse_accepting(&v3, V4_ONLY).is_err());
+
+    // The same narrowing reaches the title-routing parser.
+    let mut named = v4.clone();
+    named.extend_from_slice(b"SyntheticTitle\0");
+    assert_eq!(
+        parse_named_init_accepting(&named, V3_ONLY),
+        Err(NamedInitRefusal::NotInit(NatNegError::UnsupportedVersion {
+            version: 4,
+            accepted: V3_ONLY
+        }))
+    );
+    assert!(parse_named_init_accepting(&named, V4_ONLY).is_ok());
+}
+
+/// The exact twenty bytes the mkvsdcu v3 listener puts on the wire for a
+/// successful introduction.
+#[test]
+fn a_v3_connect_matches_the_consumer_byte_for_byte() {
+    assert_eq!(
+        connect_versioned(Version::V3, 1, [10, 0, 0, 2], 6500, Outcome::Introduced),
+        vec![
+            253, 252, 30, 102, 106, 178, 3, 5, 0, 0, 0, 1, 10, 0, 0, 2, 25, 100, 0, 0
+        ],
+    );
+    // Only offset 6 differs between the generations.
+    let v4 = connect_versioned(Version::V4, 1, [10, 0, 0, 2], 6500, Outcome::Introduced);
+    let v3 = connect_versioned(Version::V3, 1, [10, 0, 0, 2], 6500, Outcome::Introduced);
+    assert_eq!(v4[6], 4);
+    assert_eq!(v3[6], 3);
+    assert_eq!(&v4[..6], &v3[..6]);
+    assert_eq!(&v4[7..], &v3[7..]);
+    // The legacy builder is still version 4 and still a success.
+    assert_eq!(connect(1, [10, 0, 0, 2], 6500), v4);
+}
+
+/// A failure CONNECT carries its code at the last byte and is the one kind
+/// of CONNECT that must not be retried, because the client never answers it.
+#[test]
+fn a_failure_connect_carries_its_code_and_is_never_acknowledged() {
+    for (outcome, byte) in [
+        (Outcome::Introduced, finished::NO_ERROR),
+        (Outcome::NoPartner, finished::DEADBEAT_PARTNER),
+        (Outcome::InitTimedOut, finished::INIT_PACKETS_TIMEDOUT),
+        (Outcome::Other(std::num::NonZeroU8::new(77).unwrap()), 77),
+    ] {
+        let packet = connect_versioned(Version::V3, 9, [0, 0, 0, 0], 0, outcome);
+        assert_eq!(packet.len(), CONNECT_LEN);
+        assert_eq!(outcome.finished_byte(), byte);
+        assert_eq!(packet[CONNECT_LEN - 1], byte, "{outcome:?}");
+        // got-your-data stays zero for every outcome.
+        assert_eq!(packet[CONNECT_LEN - 2], 0);
+        assert_eq!(
+            outcome.is_acknowledged(),
+            byte == finished::NO_ERROR,
+            "only FINISHED_NOERROR draws a connect_ack: {outcome:?}"
+        );
+    }
+}
+
+/// The two INIT_ACK shapes differ only in bytes the client reads nowhere, and
+/// the field-built one is the consumer's packet exactly.
+#[test]
+fn both_init_ack_shapes_say_the_same_thing_to_the_client() {
+    let init = versioned_init(Version::V3, 7, 3, 1);
+    let echoed = init_ack_shaped(&init, InitAckShape::Echoed).unwrap();
+    let fields = init_ack_shaped(&init, InitAckShape::Fields).unwrap();
+
+    // The consumer's `ack(INIT_ACK, 7, 3, 1)`: 21 bytes, version 3, the
+    // cookie, then the port type and client index over a zeroed body.
+    let mut expected = vec![0u8; INIT_WITH_ADDRESS_LEN];
+    expected[..6].copy_from_slice(&MAGIC);
+    expected[6] = 3;
+    expected[7] = packet_type::INIT_ACK;
+    expected[8..12].copy_from_slice(&7u32.to_be_bytes());
+    expected[12] = 3;
+    expected[13] = 1;
+    assert_eq!(fields, expected);
+    assert_eq!(fields, init_ack_fields(Version::V3, 7, 3, 1));
+
+    // Everything the client's INITACK handler reads: the length gate, the
+    // type, the cookie and the port type it ticks off.
+    assert_eq!(echoed.len(), fields.len());
+    assert_eq!(echoed.len(), INIT_WITH_ADDRESS_LEN);
+    assert_eq!(&echoed[..14], &fields[..14]);
+    // And the one difference: the echo carries the init's own usegameport and
+    // local address back, where the field build leaves zeroes.
+    assert_eq!(&echoed[14..], &init[14..21]);
+    assert_eq!(&fields[14..], &[0u8; 7]);
+    // Default is the echo, so an existing embedder's bytes do not move.
+    assert_eq!(init_ack(&init).unwrap(), echoed);
+}
+
+/// Both REPORT_ACK shapes clear the client's `len < INITPACKET_SIZE` gate,
+/// which is the only length requirement its handler has.
+#[test]
+fn both_report_ack_shapes_clear_the_client_length_gate() {
+    for version in Version::SUPPORTED {
+        let mut report = report_packet(0x12345678, true, Some("synthetic"));
+        report[6] = version.as_byte();
+        report[13] = 1; // client index
+
+        let echoed = report_ack_shaped(&report, ReportAckShape::Echoed).unwrap();
+        let short = report_ack_shaped(&report, ReportAckShape::InitBody).unwrap();
+        assert_eq!(echoed.len(), REPORT_LEN);
+        assert_eq!(short.len(), INIT_WITH_ADDRESS_LEN);
+        for packet in [&echoed, &short] {
+            assert!(packet.len() >= INIT_WITH_ADDRESS_LEN, "the client's gate");
+            assert_eq!(&packet[..6], &MAGIC);
+            assert_eq!(packet[6], version.as_byte(), "the peer's own version");
+            assert_eq!(packet[7], packet_type::REPORT_ACK);
+            assert_eq!(&packet[8..12], &0x12345678u32.to_be_bytes());
+        }
+        // The consumer's `ack(REPORT_ACK, cookie, 0, client)` exactly.
+        let mut expected = init_ack_fields(version, 0x12345678, 0, 1);
+        expected[7] = packet_type::REPORT_ACK;
+        assert_eq!(short, expected);
+        // Default stays the echo.
+        assert_eq!(report_ack(&report).unwrap(), echoed);
+    }
+}
+
+/// Neither acknowledgement builder can be made to answer in a version the
+/// peer did not use, and neither field-built shape accepts an unsupported one.
+#[test]
+fn acknowledgements_answer_in_the_version_they_were_sent() {
+    for version in Version::SUPPORTED {
+        let init = versioned_init(version, 5, 1, 0);
+        for shape in [InitAckShape::Echoed, InitAckShape::Fields] {
+            assert_eq!(init_ack_shaped(&init, shape).unwrap()[6], version.as_byte());
+        }
+        let mut report = report_packet(5, false, None);
+        report[6] = version.as_byte();
+        for shape in [ReportAckShape::Echoed, ReportAckShape::InitBody] {
+            assert_eq!(
+                report_ack_shaped(&report, shape).unwrap()[6],
+                version.as_byte()
+            );
+        }
+    }
+    // An unsupported version cannot be decoded into a Version, so the
+    // field-built shapes refuse rather than invent one. The echoing shapes
+    // pass the byte through, which is what echoing means.
+    let mut odd = init_packet(5, 1, 0);
+    odd[6] = 9;
+    assert_eq!(init_ack_shaped(&odd, InitAckShape::Fields), None);
+    assert_eq!(init_ack_shaped(&odd, InitAckShape::Echoed).unwrap()[6], 9);
+    assert_eq!(report_ack_shaped(&odd, ReportAckShape::InitBody), None);
 }
