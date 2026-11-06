@@ -1,6 +1,6 @@
 [package]
 name = "gamespy-proto"
-version = "0.1.2"
+version = "0.1.3"
 description = "GameSpy wire codecs for embedded game servers"
 edition.workspace = true
 license.workspace = true

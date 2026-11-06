@@ -28,6 +28,29 @@ use std::{sync::Arc, time::Instant};
 pub trait Backend: Observer + Sync {
     fn heartbeat(&self, id: SessionId, data: SessionData, now: Instant);
     fn keepalive(&self, id: SessionId, now: Instant) -> KeepaliveOutcome;
+    /// Move an admitted session's deadline for a packet that is not a
+    /// keepalive, without changing what it advertises.
+    ///
+    /// [`crate::qr2::handle_with_challenges`] calls this for an admitted
+    /// host's own heartbeat. That path does not re-list a host on a
+    /// heartbeat — the heartbeat opens a challenge and only the answer admits
+    /// a snapshot — so without it a verified host's deadline rides on its
+    /// keepalives alone, and two lost keepalives expire a host every one of
+    /// whose heartbeats arrived. [`crate::registry::SessionRegistry::refresh`]
+    /// has the arithmetic.
+    ///
+    /// The default delegates to [`Backend::keepalive`], which gives an
+    /// implementation written before this existed the right deadline
+    /// behaviour with no change at all: both move the deadline only if it has
+    /// not passed, neither revives an expired entry, and the three outcomes
+    /// mean the same thing in both. The one imprecision is that an
+    /// implementation forwarding to [`crate::registry::SessionRegistry`] then
+    /// fires [`crate::registry::Policy::keepalive`] for a heartbeat. Override
+    /// this with [`crate::registry::SessionRegistry::refresh`] to keep the two
+    /// hooks apart.
+    fn refresh(&self, id: SessionId, now: Instant) -> KeepaliveOutcome {
+        self.keepalive(id, now)
+    }
     fn exit(&self, id: &SessionId) -> bool;
     fn sweep(&self, now: Instant) -> Vec<SessionId>;
     fn availability(&self, id: &SessionId, now: Instant) -> Availability;

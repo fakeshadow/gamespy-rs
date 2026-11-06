@@ -112,8 +112,72 @@ fn a_short_datagram_is_refused_rather_than_indexed() {
 #[test]
 fn an_unhandled_type_names_itself_for_the_log() {
     let mut packet = init_packet(1, 0, 0);
-    packet[7] = 0x0F; // PREINIT, which this build does not serve
-    assert_eq!(parse(&packet), Err(NatNegError::UnhandledType(0x0F)));
+    packet[7] = 0x11; // not a type any source here defines
+    assert_eq!(parse(&packet), Err(NatNegError::UnhandledType(0x11)));
+}
+
+/// A preinit is parsed and answered, because a version 4 peer that is not
+/// answered never sends an INIT at all.
+///
+/// Layout read from the Homefront PS3 EBOOT: 18 bytes, `clientindex` at 12,
+/// `state` at 13, a four-byte client id at 14. `NNProcessData` refuses
+/// anything shorter (`cmpwi r30, 0x12` at `0x0086610c`).
+#[test]
+fn a_preinit_is_parsed_and_answered_with_the_state_that_releases_the_peer() {
+    let mut packet = vec![0u8; PREINIT_LEN];
+    packet[..MAGIC.len()].copy_from_slice(&MAGIC);
+    packet[6] = Version::V4.as_byte();
+    packet[7] = packet_type::PREINIT;
+    packet[8..12].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+    packet[12] = 1; // clientindex
+    packet[13] = 0; // the peer's own state byte
+    packet[14..18].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+
+    assert_eq!(
+        parse(&packet),
+        Ok(Packet::Preinit(Preinit {
+            version: Version::V4,
+            cookie: 0xDEAD_BEEF,
+            client_index: 1,
+            state: 0,
+            client_id: [0x11, 0x22, 0x33, 0x44],
+        }))
+    );
+
+    // Too short is refused rather than answered: the client refuses it too.
+    for length in 0..PREINIT_LEN {
+        assert!(matches!(
+            parse(&packet[..length]),
+            Err(NatNegError::TooShort | NatNegError::WrongMagic)
+        ));
+        assert_eq!(preinit_ack(&packet[..length], preinit_state::READY), None);
+    }
+
+    let ack = preinit_ack(&packet, preinit_state::READY).unwrap();
+    assert_eq!(ack.len(), PREINIT_LEN);
+    assert_eq!(&ack[..MAGIC.len()], &MAGIC);
+    assert_eq!(ack[6], Version::V4.as_byte(), "the recipient's own version");
+    assert_eq!(ack[7], packet_type::PREINIT_ACK);
+    assert_eq!(&ack[8..12], &0xDEAD_BEEFu32.to_be_bytes());
+    assert_eq!(ack[12], 1, "the peer's client index is echoed");
+    assert_eq!(
+        ack[13],
+        preinit_state::READY,
+        "2 is what starts the init phase"
+    );
+    assert_eq!(&ack[14..18], &[0x11, 0x22, 0x33, 0x44], "client id echoed");
+
+    // The waiting form differs only in that byte.
+    let waiting = preinit_ack(&packet, preinit_state::WAITING).unwrap();
+    assert_eq!(waiting[13], preinit_state::WAITING);
+    assert_eq!(waiting[..13], ack[..13]);
+    assert_eq!(waiting[14..], ack[14..]);
+
+    // A version 3 peer never sends one, but if it did the reply would carry
+    // its version, not this build's.
+    let mut v3 = packet.clone();
+    v3[6] = Version::V3.as_byte();
+    assert_eq!(preinit_ack(&v3, preinit_state::READY).unwrap()[6], 3);
 }
 
 /// The client refuses a CONNECT under twenty bytes outright
@@ -355,7 +419,7 @@ fn defined_types_parse_and_only_unknown_ones_are_refused() {
         parse(&typed(packet_type::REPORT)),
         Ok(Packet::Report(report)) if report.cookie == 0xABCD
     ));
-    for unknown in [2u8, 3, 4, 8, 9, 10, 11, 12, 0x0F, 0x11, 0xFF] {
+    for unknown in [2u8, 3, 4, 8, 9, 10, 11, 12, 0x11, 0xFF] {
         assert_eq!(
             parse(&typed(unknown)),
             Err(NatNegError::UnhandledType(unknown)),

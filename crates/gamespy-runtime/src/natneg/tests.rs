@@ -101,6 +101,12 @@ fn title_scopes_survive_cookie_collisions_retries_and_expiry() {
     );
 }
 
+/// A mapping observed on the first socket, for the tests that do not care
+/// which socket it was.
+fn mapped(address: SocketAddr) -> Mapping {
+    Mapping { socket: 0, address }
+}
+
 fn side(last: u8, index: u8) -> Side {
     let now = Instant::now();
     Side {
@@ -948,6 +954,92 @@ fn control(packet_type: u8, cookie: u32) -> Vec<u8> {
     packet
 }
 
+/// A version 4 `NN_PREINIT`, the packet a Homefront-generation client sends
+/// before any init.
+fn preinit(cookie: u32, index: u8, state: u8) -> Vec<u8> {
+    let mut packet = natneg::MAGIC.to_vec();
+    packet.extend_from_slice(&[natneg::VERSION, natneg::packet_type::PREINIT]);
+    packet.extend_from_slice(&cookie.to_be_bytes());
+    packet.extend_from_slice(&[index, state]);
+    packet.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+    assert_eq!(packet.len(), natneg::PREINIT_LEN);
+    packet
+}
+
+/// A preinit is answered with state 2, which is the only thing that lets a
+/// version 4 peer send an init at all.
+///
+/// Read from the Homefront PS3 EBOOT: `SendInitPackets` (`0x00865b18`) has
+/// two callers, the preinit-ack handler at `0x00866318` and the retry loop at
+/// `0x00866d0c`, and both require the negotiator's post-preinit state. An
+/// unanswered peer resends `NN_PREINIT` and then fails, so the listener never
+/// sees an init and nothing in the pairing engine runs.
+#[test]
+fn a_preinit_is_answered_so_a_version_4_peer_can_send_its_inits() {
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = server.local_addr().unwrap();
+    let capture = Capture::default();
+    let listener = spawn_with_socket(server, capture.clone()).unwrap();
+
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.send_to(&preinit(0x0BAD_F00D, 1, 0), bind).unwrap();
+    let reply = recv(&peer, "a preinit ack");
+
+    assert_eq!(reply.len(), natneg::PREINIT_LEN);
+    assert_eq!(&reply[..natneg::MAGIC.len()], &natneg::MAGIC);
+    assert_eq!(reply[6], natneg::VERSION, "the peer's own version");
+    assert_eq!(reply[7], natneg::packet_type::PREINIT_ACK);
+    assert_eq!(&reply[8..12], &0x0BAD_F00Du32.to_be_bytes());
+    assert_eq!(reply[12], 1, "client index echoed");
+    assert_eq!(
+        reply[13],
+        natneg::preinit_state::READY,
+        "state 2 is what calls SendInitPackets"
+    );
+    assert_eq!(
+        &reply[14..18],
+        &[0xAA, 0xBB, 0xCC, 0xDD],
+        "client id echoed"
+    );
+
+    // Joined before reading the capture: the observer callback runs after the
+    // datagram is on the wire, so the peer can receive the reply first.
+    listener.shutdown().unwrap();
+    let trace = capture
+        .find("preinit_ack sent")
+        .unwrap_or_else(|| panic!("no preinit_ack trace in {:#?}", capture.lines()));
+    assert!(
+        trace.contains("releases the peer into the init phase"),
+        "{trace}"
+    );
+
+    // A deployment can turn it off, and then says so rather than going quiet.
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = server.local_addr().unwrap();
+    let capture = Capture::default();
+    let off = spawn_with_policy(
+        server,
+        capture.clone(),
+        Policy {
+            serve_preinit: false,
+            ..Policy::default()
+        },
+    )
+    .unwrap();
+    peer.send_to(&preinit(0x0BAD_F00D, 1, 0), bind).unwrap();
+    expect_silence(
+        &peer,
+        Duration::from_millis(250),
+        "preinit is not answered when disabled",
+    );
+    assert!(
+        capture.find("disabled preinit").is_some(),
+        "the refusal is recorded: {:#?}",
+        capture.lines()
+    );
+    off.shutdown().unwrap();
+}
+
 /// An init for a listener that routes titles.
 fn named_init(cookie: u32, index: u8, title: &str) -> Vec<u8> {
     let mut packet = natneg::MAGIC.to_vec();
@@ -1693,7 +1785,7 @@ fn readiness_requires_every_registration_the_peer_will_use() {
     partial.use_game_port = true;
     partial
         .mappings
-        .insert(natneg::port_type::NEGOTIATION_1, partial.address);
+        .insert(natneg::port_type::NEGOTIATION_1, mapped(partial.address));
     assert!(
         is_ready(&partial, Readiness::OnFirstInit),
         "the default introduces from the first init"
@@ -1712,7 +1804,7 @@ fn readiness_requires_every_registration_the_peer_will_use() {
         natneg::port_type::NEGOTIATION_2,
         natneg::port_type::NEGOTIATION_3,
     ] {
-        partial.mappings.insert(port_type, partial.address);
+        partial.mappings.insert(port_type, mapped(partial.address));
     }
     // Still short of the game port it said it would use.
     assert!(!is_ready(&partial, Readiness::AllRegistrations));
@@ -1722,7 +1814,7 @@ fn readiness_requires_every_registration_the_peer_will_use() {
     );
     partial
         .mappings
-        .insert(natneg::port_type::GAME, partial.address);
+        .insert(natneg::port_type::GAME, mapped(partial.address));
     assert!(is_ready(&partial, Readiness::AllRegistrations));
     assert!(missing_registrations(&partial).is_empty());
 
@@ -1733,7 +1825,7 @@ fn readiness_requires_every_registration_the_peer_will_use() {
     for port_type in natneg::port_type::NEGOTIATION_1..=natneg::port_type::NEGOTIATION_3 {
         no_game_port
             .mappings
-            .insert(port_type, no_game_port.address);
+            .insert(port_type, mapped(no_game_port.address));
     }
     assert!(is_ready(&no_game_port, Readiness::AllRegistrations));
     assert!(missing_registrations(&no_game_port).is_empty());
@@ -1749,18 +1841,20 @@ fn a_connect_goes_to_the_control_mapping_and_advertises_the_game_mapping() {
 
     let mut peer = side(10, 0);
     peer.use_game_port = true;
-    peer.address = negotiate;
-    peer.mappings.insert(natneg::port_type::GAME, game);
+    peer.mappings.insert(natneg::port_type::GAME, mapped(game));
     peer.mappings
-        .insert(natneg::port_type::NEGOTIATION_1, negotiate);
+        .insert(natneg::port_type::NEGOTIATION_1, mapped(negotiate));
     // The latest init happened to be the game port's.
     peer.address = game;
     peer.port_type = natneg::port_type::GAME;
 
-    assert_eq!(control_endpoint(&peer, ControlEndpoint::LatestInit), game);
+    assert_eq!(
+        control_endpoint(&peer, ControlEndpoint::LatestInit),
+        mapped(game)
+    );
     assert_eq!(
         control_endpoint(&peer, ControlEndpoint::NegotiationMapping),
-        negotiate,
+        mapped(negotiate),
         "control traffic belongs on the socket the negotiation state machine owns"
     );
     // What a partner is told to punch is a separate question, and is the
@@ -1772,7 +1866,10 @@ fn a_connect_goes_to_the_control_mapping_and_advertises_the_game_mapping() {
     let bare = side(11, 1);
     assert_eq!(
         control_endpoint(&bare, ControlEndpoint::NegotiationMapping),
-        bare.address
+        Mapping {
+            socket: bare.socket,
+            address: bare.address
+        }
     );
 
     // And the retry pass sends to the configured endpoint, not to whichever
@@ -1790,6 +1887,126 @@ fn a_connect_goes_to_the_control_mapping_and_advertises_the_game_mapping() {
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].target, negotiate);
     assert_eq!(due[0].partner, partner);
+}
+
+/// A CONNECT leaves from the socket that observed the endpoint it is
+/// addressed to, not from whichever socket the latest init arrived on.
+///
+/// `SendInitPackets` sends `NN_PT_NN2` to matchup2 and `NN_PT_NN3` to
+/// matchup3, and NN3 last — so on a deployment that binds one socket per
+/// matchup address, the latest init is normally the natneg3 one. Addressing
+/// the NN1 mapping while sending from that socket put the packet on the wire
+/// from an address the peer's NAT never opened a mapping for, and a
+/// port-restricted or symmetric NAT drops it.
+#[test]
+fn a_connect_leaves_from_the_socket_that_observed_its_endpoint() {
+    let host: IpAddr = [10, 0, 0, 12].into();
+    let negotiate = SocketAddr::new(host, 50000);
+    let via_matchup3 = SocketAddr::new(host, 50002);
+
+    let mut peer = side(12, 0);
+    // One socket per matchup address: GP and NN1 both go to matchup1.
+    peer.mappings.insert(
+        natneg::port_type::NEGOTIATION_1,
+        Mapping {
+            socket: 0,
+            address: negotiate,
+        },
+    );
+    peer.mappings.insert(
+        natneg::port_type::NEGOTIATION_3,
+        Mapping {
+            socket: 2,
+            address: via_matchup3,
+        },
+    );
+    // NN3 went out last, so the side's own socket and address are natneg3's.
+    peer.port_type = natneg::port_type::NEGOTIATION_3;
+    peer.address = via_matchup3;
+    peer.socket = 2;
+
+    assert_eq!(
+        control_endpoint(&peer, ControlEndpoint::NegotiationMapping),
+        Mapping {
+            socket: 0,
+            address: negotiate
+        },
+        "the NN1 mapping must carry the socket that observed it, not socket 2"
+    );
+
+    let mut pending = Pending::new(Policy {
+        control_endpoint: ControlEndpoint::NegotiationMapping,
+        ..Policy::default()
+    });
+    let now = peer.seen;
+    pending.accept_init("", 9, &peer).unwrap();
+    let partner = SocketAddrV4::new([203, 0, 113, 20].into(), 3658);
+    assert!(pending.arm_connect("", 9, SideKey::of(&peer), partner, now));
+    let due = pending.due_connects(now + CONNECT_RETRY);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].target, negotiate);
+    assert_eq!(
+        due[0].socket, 0,
+        "a connect addressed to the natneg1 mapping must leave the natneg1 socket"
+    );
+
+    // The same pairing under LatestInit addresses natneg3's mapping, and must
+    // then leave natneg3's socket.
+    let mut latest = Pending::new(Policy {
+        control_endpoint: ControlEndpoint::LatestInit,
+        ..Policy::default()
+    });
+    latest.accept_init("", 9, &peer).unwrap();
+    assert!(latest.arm_connect("", 9, SideKey::of(&peer), partner, now));
+    let due = latest.due_connects(now + CONNECT_RETRY);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].target, via_matchup3);
+    assert_eq!(due[0].socket, 2);
+}
+
+/// Re-arming is decided by the address alone, not by whether the side already
+/// acknowledged a CONNECT.
+///
+/// An identical introduction is never duplicated, so an init resend arriving
+/// while a CONNECT is being retried does not start a second stream. A
+/// *different* address is armed even after an acknowledgement: a peer that
+/// acted on the first CONNECT is past `ns_connectping` and will acknowledge
+/// the new one without adopting it, but a peer that restarted its negotiation
+/// on the same cookie has no other way to be introduced, and suppressing the
+/// send strands it.
+#[test]
+fn re_arming_a_connect_depends_on_the_address_not_the_acknowledgement() {
+    let mut pending = Pending::default();
+    let peer = side(13, 0);
+    let now = peer.seen;
+    pending.accept_init("", 11, &peer).unwrap();
+    let key = SideKey::of(&peer);
+
+    let first = SocketAddrV4::new([203, 0, 113, 30].into(), 3658);
+    assert!(pending.arm_connect("", 11, key, first, now));
+    assert!(
+        !pending.arm_connect("", 11, key, first, now),
+        "the same introduction is not duplicated"
+    );
+
+    let acked = pending.acknowledge_connect(11, peer.address, now);
+    assert_eq!(acked.len(), 1);
+    assert!(!acked[0].repeated);
+    assert!(
+        pending.due_connects(now + CONNECT_RETRY * 2).is_empty(),
+        "an acknowledged delivery is not retried"
+    );
+    assert!(
+        !pending.arm_connect("", 11, key, first, now),
+        "and re-pairing to the same address still changes nothing"
+    );
+
+    // A different address is a different introduction, so it goes out.
+    let moved = SocketAddrV4::new([203, 0, 113, 30].into(), 7777);
+    assert!(pending.arm_connect("", 11, key, moved, now));
+    let due = pending.due_connects(now + CONNECT_RETRY);
+    assert_eq!(due.len(), 1, "the new introduction is delivered");
+    assert_eq!(due[0].partner, moved);
 }
 
 /// A CONNECT_ACK is honoured from any mapping its side announced, and from
@@ -2239,4 +2456,91 @@ fn an_introduced_side_left_alone_is_not_told_there_was_no_partner() {
         "an introduced side is not told its partner never arrived"
     );
     assert!(!pending.negotiations[&(String::new(), 7)].abandoned);
+}
+
+/// A CONNECT whose delivery attempts ran out is re-armed when the side
+/// announces again, even though the partner's address has not changed.
+///
+/// The address test alone never catches this. A peer that restarted its
+/// negotiation on the same cookie is introduced to the same partner as
+/// before whenever that partner is a stable game host, which is the ordinary
+/// case — so suppressing the send on a matching address would strand exactly
+/// the peer [`Pending::arm_connect`] says it must not strand.
+#[test]
+fn an_exhausted_connect_is_rearmed_when_the_side_announces_again() {
+    let mut pending = Pending::default();
+    let peer = side(31, 0);
+    let key = SideKey::of(&peer);
+    let start = peer.seen;
+    pending.accept_init("", 0x900d, &peer).unwrap();
+    let partner = SocketAddrV4::new([203, 0, 113, 40].into(), 7777);
+    assert!(pending.arm_connect("", 0x900d, key, partner, start));
+
+    // Spend the whole delivery budget with no acknowledgement.
+    let mut at = start;
+    let mut sent = 1;
+    for _ in 0..CONNECT_ATTEMPTS + 2 {
+        at += CONNECT_RETRY;
+        sent += pending.due_connects(at).len() as u32;
+    }
+    assert_eq!(sent, CONNECT_ATTEMPTS, "the budget is spent");
+    assert!(
+        pending.due_connects(at + CONNECT_RETRY).is_empty(),
+        "and the retry pass owns nothing further"
+    );
+
+    // The side is still here and announcing, and is paired again with the
+    // same partner at the same address.
+    let mut again = side(31, 0);
+    again.seen = at;
+    again.port_type = natneg::port_type::NEGOTIATION_2;
+    pending.accept_init("", 0x900d, &again).unwrap();
+    assert!(
+        pending.arm_connect("", 0x900d, key, partner, at),
+        "a delivery whose attempts ran out is restarted rather than suppressed"
+    );
+
+    // Delivery really restarted: a full fresh budget, not a counter still
+    // sitting at its limit.
+    let due = pending.due_connects(at + CONNECT_RETRY);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].partner, partner);
+    assert_eq!(
+        due[0].attempt, 2,
+        "this is the second copy of a new delivery"
+    );
+    assert!(!due[0].final_attempt);
+}
+
+/// The counterpart: while delivery is still running, a re-pairing to the same
+/// address changes nothing, so an init resend cannot turn one introduction
+/// into two streams of CONNECTs.
+#[test]
+fn a_connect_still_being_delivered_is_not_restarted_by_a_resend() {
+    let mut pending = Pending::default();
+    let peer = side(32, 0);
+    let key = SideKey::of(&peer);
+    let start = peer.seen;
+    pending.accept_init("", 0x900e, &peer).unwrap();
+    let partner = SocketAddrV4::new([203, 0, 113, 41].into(), 7777);
+    assert!(pending.arm_connect("", 0x900e, key, partner, start));
+
+    // Part-way through the budget, well short of it.
+    let mut at = start;
+    for _ in 0..3 {
+        at += CONNECT_RETRY;
+        assert_eq!(pending.due_connects(at).len(), 1);
+    }
+
+    let mut again = side(32, 0);
+    again.seen = at;
+    again.port_type = natneg::port_type::NEGOTIATION_2;
+    pending.accept_init("", 0x900e, &again).unwrap();
+    assert!(
+        !pending.arm_connect("", 0x900e, key, partner, at),
+        "delivery the retry pass still owns is not duplicated"
+    );
+    let due = pending.due_connects(at + CONNECT_RETRY);
+    assert_eq!(due.len(), 1, "one stream of connects, not two");
+    assert_eq!(due[0].attempt, 5, "the original delivery simply continued");
 }

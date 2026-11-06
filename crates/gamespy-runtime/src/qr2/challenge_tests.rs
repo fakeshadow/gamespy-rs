@@ -99,6 +99,23 @@ impl Backend for Recorder {
             KeepaliveOutcome::UnknownInstance
         }
     }
+    /// Overridden so the keepalive counter stays a count of keepalives. The
+    /// default would route a heartbeat's deadline refresh through
+    /// [`Backend::keepalive`], and these tests heartbeat admitted hosts.
+    /// This stand-in holds no deadlines, so a refresh is a presence check.
+    fn refresh(&self, id: SessionId, _: Instant) -> KeepaliveOutcome {
+        if self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(held, _)| *held == id)
+        {
+            KeepaliveOutcome::Refreshed
+        } else {
+            KeepaliveOutcome::UnknownInstance
+        }
+    }
     fn exit(&self, id: &SessionId) -> bool {
         *self.exits.lock().unwrap() += 1;
         let mut sessions = self.sessions.lock().unwrap();

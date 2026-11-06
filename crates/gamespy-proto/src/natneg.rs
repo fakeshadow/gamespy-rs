@@ -225,11 +225,65 @@ pub mod packet_type {
     ///
     /// `NN_REPORT_ACK`, the last type this SDK generation defines.
     pub const REPORT_ACK: u8 = 14;
-    /// Also handled (`0x00ae3924`); this project has not read its body. Not
-    /// present in the SDK generation `nninternal.h` documents, which ends at
-    /// `NN_REPORT_ACK` (14), so `0x10` is read from this client alone.
+    /// `NN_PREINIT`: what a version 4 peer sends **before** any [`INIT`], and
+    /// keeps resending until it is acknowledged.
+    ///
+    /// Read from the Homefront PS3 EBOOT (`NNBeginNegotiation*` builds it at
+    /// `0x008659d8`-`0x00865a24`: `li r4, 4` into buffer offset 6, `li r6,
+    /// 0xf` into offset 7, cookie at 8, `clientindex` at 12). Not present in
+    /// the SDK generation `nninternal.h` documents, which ends at
+    /// [`REPORT_ACK`] (14).
+    ///
+    /// **A server that does not answer this never sees an INIT.** See
+    /// [`PREINIT_ACK`].
+    pub const PREINIT: u8 = 0x0F;
+    /// `NN_PREINIT_ACK`: the reply that releases a version 4 peer into the
+    /// INIT phase, **and the only thing that can**.
+    ///
+    /// Read from the Homefront PS3 EBOOT. `NNProcessData` dispatches type
+    /// `0x10` at `0x00866104` with a minimum length of `0x12` (18) bytes, and
+    /// its handler at `0x008662b4`:
+    ///
+    /// - advances the negotiator's state field to 1 and fires the title's
+    ///   progress callback, setting `retryTime = now + 10000` and
+    ///   `maxRetryCount = 12` — so a peer told to wait is parked for about two
+    ///   minutes rather than the roughly five seconds an INIT budget allows;
+    /// - reads the packet's own `state` byte at offset 13 and calls
+    ///   `SendInitPackets` (`0x00865b18`) **only when it is
+    ///   [`preinit_state::READY`]** (`cmpwi`/`crorc` at
+    ///   `0x00866304`-`0x00866310`).
+    ///
+    /// `SendInitPackets` has exactly two callers in that binary, this handler
+    /// and the retry loop at `0x00866d0c`, and both require the negotiator's
+    /// state to be 2. Nothing else reaches it, so **no acknowledgement means
+    /// no INIT, ever**: the peer resends [`PREINIT`] until its budget runs out
+    /// and reports a failure the pairing engine never sees.
     pub const PREINIT_ACK: u8 = 0x10;
 }
+
+/// The `state` byte at offset 13 of a [`packet_type::PREINIT`] exchange.
+///
+/// Read from the Homefront PS3 EBOOT's handler at
+/// `0x00866300`-`0x00866318`, which releases the peer into the INIT phase on
+/// [`READY`](preinit_state::READY) and parks it on anything else. The names
+/// are this project's; only the two values and their effects are observed.
+pub mod preinit_state {
+    /// Observed effect: the peer advances to its second preinit state, fires
+    /// the title's progress callback, and waits on a 10-second timer with 12
+    /// attempts. Use this to hold a peer whose partner has not arrived.
+    pub const WAITING: u8 = 1;
+    /// Observed effect: the peer calls `SendInitPackets`. This is the byte
+    /// that starts a negotiation.
+    pub const READY: u8 = 2;
+}
+
+/// Smallest `NN_PREINIT`/`NN_PREINIT_ACK` the client will look at.
+///
+/// `cmpwi r30, 0x12` at `0x0086610c` refuses anything shorter, and the handler
+/// then copies exactly `0x12` bytes. That is [`HEADER_LEN`] plus a six-byte
+/// body — `clientindex`, `state`, and a four-byte client id — which is why the
+/// body is read at offsets 12 and 13.
+pub const PREINIT_LEN: usize = HEADER_LEN + 6;
 
 /// Which of a peer's sockets an INIT is announcing.
 ///
@@ -372,6 +426,27 @@ pub struct Report {
     pub game_name: Option<String>,
 }
 
+/// A version 4 peer announcing a cookie before the INIT phase.
+///
+/// See [`packet_type::PREINIT`] for why this must be answered, and
+/// [`preinit_ack`] for how.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Preinit {
+    pub version: Version,
+    pub cookie: u32,
+    /// Offset 12, written by the client at `0x00865a24`.
+    pub client_index: u8,
+    /// Offset 13, the same slot a reply's [`preinit_state`] occupies. The
+    /// client's own value here has not been traced to a use by this project;
+    /// it is carried so a capture records it.
+    pub state: u8,
+    /// Offsets 14..18. The reference client reserves them and this project
+    /// has not seen them read, so they are carried only to be echoed back.
+    /// Always present: [`parse`] refuses anything shorter than
+    /// [`PREINIT_LEN`], exactly as the client does.
+    pub client_id: [u8; 4],
+}
+
 /// A parsed negotiation packet.
 ///
 /// Every type the protocol defines parses to one of these variants, so a
@@ -381,6 +456,11 @@ pub struct Report {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Packet {
     Init(Init),
+    /// A version 4 peer announcing a cookie **before** the INIT phase, which
+    /// must be answered with [`preinit_ack`] carrying
+    /// [`preinit_state::READY`] or that peer never sends an INIT at all.
+    /// See [`packet_type::PREINIT`].
+    Preinit(Preinit),
     /// A peer acknowledging the CONNECT it was sent. Only the cookie is read:
     /// it is what names the negotiation being acknowledged, and the body has
     /// not been traced in this project.
@@ -400,6 +480,12 @@ pub enum Packet {
     ///
     /// Recognised rather than refused so a listener records it as protocol
     /// traffic instead of as a malformed datagram.
+    ///
+    /// [`packet_type::PREINIT_ACK`] belongs here only as reflection of this
+    /// service's **own** reply. The request a client sends is
+    /// [`packet_type::PREINIT`], which parses to [`Packet::Preinit`] and is
+    /// not optional: see that constant for the evidence that a peer which is
+    /// never answered sends no INIT at all.
     Unacted {
         version: Version,
         packet_type: u8,
@@ -412,6 +498,7 @@ impl Packet {
     pub fn version(&self) -> Version {
         match self {
             Self::Init(init) => init.version,
+            Self::Preinit(preinit) => preinit.version,
             Self::Report(report) => report.version,
             Self::ConnectAck { version, .. } | Self::Unacted { version, .. } => *version,
         }
@@ -421,6 +508,7 @@ impl Packet {
     pub fn cookie(&self) -> u32 {
         match self {
             Self::Init(init) => init.cookie,
+            Self::Preinit(preinit) => preinit.cookie,
             Self::Report(report) => report.cookie,
             Self::ConnectAck { cookie, .. } | Self::Unacted { cookie, .. } => *cookie,
         }
@@ -564,6 +652,20 @@ pub fn parse_accepting(
                 local_address,
             }))
         }
+        packet_type::PREINIT => {
+            if datagram.len() < PREINIT_LEN {
+                // The client refuses a short one itself (`cmpwi r30, 0x12`),
+                // so this is not a packet to answer.
+                return Err(NatNegError::TooShort);
+            }
+            Ok(Packet::Preinit(Preinit {
+                version,
+                cookie,
+                client_index: datagram[12],
+                state: datagram[13],
+                client_id: [datagram[14], datagram[15], datagram[16], datagram[17]],
+            }))
+        }
         packet_type::CONNECT_ACK => Ok(Packet::ConnectAck { version, cookie }),
         packet_type::REPORT => Ok(Packet::Report(
             report_of(datagram).ok_or(NatNegError::TooShort)?,
@@ -699,6 +801,33 @@ pub fn init_ack_fields(version: Version, cookie: u32, port_type: u8, client_inde
 /// not interpret.
 ///
 /// `None` when the datagram is shorter than a header, which is not a report.
+/// Build the `NN_PREINIT_ACK` that answers `preinit`, carrying `state`.
+///
+/// Echoes the request's header and body and overwrites offset 13 with
+/// `state`, the same shape rule [`init_ack_shaped`] and [`report_ack_shaped`]
+/// use for their echoed forms: every other field is the peer's own, so
+/// nothing is invented. `None` when the input is shorter than
+/// [`PREINIT_LEN`], which the client would refuse anyway.
+///
+/// Pass [`preinit_state::READY`] to release the peer into the INIT phase, or
+/// [`preinit_state::WAITING`] to park it on its 10-second timer while its
+/// partner is still missing. **A peer that is sent neither sends no INIT**;
+/// see [`packet_type::PREINIT_ACK`].
+pub fn preinit_ack(preinit: &[u8], state: u8) -> Option<Vec<u8>> {
+    if preinit.len() < PREINIT_LEN {
+        return None;
+    }
+    let mut packet = Vec::with_capacity(PREINIT_LEN);
+    packet.extend_from_slice(&MAGIC);
+    // The recipient's own version, for the reason given on `Version`.
+    packet.push(preinit[6]);
+    packet.push(packet_type::PREINIT_ACK);
+    packet.extend_from_slice(&preinit[8..PREINIT_LEN]);
+    packet[13] = state;
+    debug_assert_eq!(packet.len(), PREINIT_LEN);
+    Some(packet)
+}
+
 pub fn report_ack(report: &[u8]) -> Option<Vec<u8>> {
     report_ack_shaped(report, ReportAckShape::Echoed)
 }

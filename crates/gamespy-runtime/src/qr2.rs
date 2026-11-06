@@ -289,13 +289,17 @@ pub fn handle(
 ///
 /// ```text
 /// heartbeat        → validate the key block and the gamename against `title`
+///                  → move an already-admitted session's deadline, without
+///                    changing what it advertises
 ///                  → open or refresh a pending generation (nothing is listed)
 ///                  → issue the generation's challenge
 /// challenge reply  → resolve the exact pending binding
 ///                  → check the response, the source, the title and the deadline
 ///                  → consume the generation and admit its latest snapshot
 /// exit             → cancel the pending generation; remove any admitted session
-/// keepalive        → refresh an admitted session only; never promotes a pending one
+/// keepalive        → refresh an admitted session that is still inside its
+///                    deadline, and answer it with a master keepalive
+///                  → expired, unknown or pending-only: no refresh, no reply
 /// ```
 pub fn handle_with_challenges(
     socket: &UdpSocket,
@@ -465,6 +469,46 @@ fn dispatch(
             }
 
             let now = Instant::now();
+
+            // An admitted host's own heartbeat moves its deadline, before any
+            // of the pending-table work below. This path does not re-list on
+            // a heartbeat — the snapshot is held unverified until the
+            // challenge is answered — so without this the session's deadline
+            // rides on its keepalives alone, and those do not arrive evenly:
+            // the SDK resets the keepalive timer whenever it sends a
+            // heartbeat (`qr2.c:1652`), leaving a 40-second gap in every
+            // 60-second cycle. Two keepalives lost across it expire a host
+            // every one of whose heartbeats arrived. See
+            // `SessionRegistry::refresh`.
+            //
+            // Nothing is listed here and no metadata changes, so the rule
+            // that only a verified snapshot reaches a list reply still holds.
+            match registry.refresh(id, now) {
+                KeepaliveOutcome::Refreshed => registry.peer_event(
+                    "qr2",
+                    peer,
+                    &format!(
+                        "heartbeat: session deadline refreshed (instance {}); what is listed \
+                         is unchanged, since only an answered challenge admits a snapshot",
+                        crate::observe::hex(&instance_key)
+                    ),
+                ),
+                KeepaliveOutcome::Expired => registry.peer_event(
+                    "qr2",
+                    peer,
+                    &format!(
+                        "heartbeat for a session whose deadline had already passed (instance \
+                         {}); nothing refreshed and the sweep removes it, and only an \
+                         answered challenge re-lists this host",
+                        crate::observe::hex(&instance_key)
+                    ),
+                ),
+                // The ordinary case for a host that is not admitted yet.
+                // Silent: a line here would land on every heartbeat of every
+                // pending host for as long as it failed to answer.
+                KeepaliveOutcome::UnknownInstance => {}
+            }
+
             let key = (peer, instance_key);
 
             // A live generation keeps its challenge and its deadline, and
@@ -630,24 +674,62 @@ fn dispatch(
 
         HostPacket::Keepalive { instance_key } => {
             let id = SessionId::new(peer, instance_key);
+            // The instance key goes on every line below. A host's keepalives
+            // and its heartbeats can disagree about it — it changes when the
+            // game re-initialises its QR2 object — so without it a keepalive
+            // for an instance no session holds cannot be attributed to a
+            // swept session or to a new one, which is the question the
+            // deployment logs leave open. The source socket is already in
+            // `peer`, which every observer receives, so it is not repeated
+            // here.
+            let trace = format!("instance {}", crate::observe::hex(&instance_key));
             let outcome = registry.keepalive(id, Instant::now());
             match outcome {
+                // Keepalives refresh an admitted session under the existing
+                // rules and are not re-authenticated. That preserves current
+                // liveness semantics deliberately: a challenge is an
+                // admission step, not a per-packet credential check. The
+                // refresh has already happened here; [`send_keepalive`]
+                // answers it and records both in one line.
                 KeepaliveOutcome::Refreshed => {
-                    // Keepalives refresh an admitted session under the
-                    // existing rules and are not re-authenticated. That
-                    // preserves current liveness semantics deliberately: a
-                    // challenge is an admission step, not a per-packet
-                    // credential check.
-                    registry.peer_event("qr2", peer, "keepalive: session deadline refreshed")
+                    send_keepalive(socket, peer, registry, instance_key, &trace)
                 }
+                // The deadline had already passed, so there was nothing to
+                // refresh and nothing to answer. Answering would reset the
+                // host's own retry counter (`qr2.c:1479`) on behalf of a
+                // session that is not listed, which is the one thing that
+                // would make the host stop reporting the problem.
+                KeepaliveOutcome::Expired => registry.peer_event(
+                    "qr2",
+                    peer,
+                    &format!(
+                        "keepalive for a session whose deadline had already passed; nothing \
+                         refreshed and nothing sent, the sweep removes it ({trace})"
+                    ),
+                ),
                 // Nothing is created: a keepalive carries no session data, so
-                // there would be nothing truthful to list. This is expected
-                // after a restart, when a host that was already registered
-                // keeps sending keepalives and never re-announces, because it
-                // only re-sends heartbeats while its own retry counter is
-                // positive. Whether anything can prompt a fresh heartbeat is
-                // an open question — recorded so a RUN shows how often it
-                // happens.
+                // there would be nothing truthful to list.
+                //
+                // **A keepalive cannot restore a session, and a full
+                // heartbeat can.** The host keeps announcing on its own: the
+                // SDK sends a heartbeat every `HB_TIME` (60s) and a keepalive
+                // every `KA_TIME` (20s) for as long as its record is public,
+                // independently of the retry counter, which only drives the
+                // faster `FIRST_HB_TIME` burst before a listing is confirmed
+                // (`qr2.c:504-531`). So the next heartbeat re-registers the
+                // host with metadata that was actually announced, and this
+                // path only has to not lie in the meantime.
+                //
+                // Two better recoveries exist on paper and neither is
+                // implemented here. Reconstructing a session from the last
+                // heartbeat we held would list unvalidated, possibly stale
+                // metadata. A `PACKET_ADDERROR` (`0x04`) would tell the host
+                // its listing is gone, and the SDK's own handling is known —
+                // it sets `listed_state = -1`, fires `adderror_callback`
+                // once, and keeps heartbeating (`qr2.c:1576-1600`) — but what
+                // *this title's* callback does with that code is not read
+                // yet, and it is reachable enough to end hosting or raise a
+                // dialog. Read that callback before sending one.
                 KeepaliveOutcome::UnknownInstance => {
                     // A pending-only host is the other way this happens, and
                     // it must stay a no-op: promoting here would list a
@@ -663,12 +745,17 @@ fn dispatch(
                     registry.peer_event(
                         "qr2",
                         peer,
-                        if pending {
-                            "keepalive for an instance whose registration is still pending; \
-                             nothing created and no challenge deadline extended"
+                        &if pending {
+                            format!(
+                                "keepalive for an instance whose registration is still pending; \
+                                 nothing created, no challenge deadline extended and nothing \
+                                 sent ({trace})"
+                            )
                         } else {
-                            "keepalive for an instance with no heartbeat on record; nothing \
-                             registered"
+                            format!(
+                                "keepalive for an instance with no heartbeat on record; nothing \
+                                 registered and nothing sent ({trace})"
+                            )
                         },
                     );
                 }
@@ -890,6 +977,66 @@ fn send_challenge(
     }
 }
 
+/// Answer a live host's keepalive with a master-to-host keepalive.
+///
+/// `FE FD 08` and the host's own four-byte instance key, unchanged: the seven
+/// bytes of [`qr2::MASTER_HEADER_LEN`] and no payload. The SDK dispatches this
+/// type to a bare `return` without reading past the header or even checking
+/// the key (`qr2.c:1624`), so there is nothing truthful to add; seven bytes is
+/// also the shortest datagram it will look at at all (`qr2.c:1434`), so
+/// nothing shorter would do.
+///
+/// **What this buys, precisely.** The session's deadline was already refreshed
+/// before this is called, so the reply changes nothing about what is listed.
+/// Its one effect is on the host: any inbound packet carrying the magic clears
+/// `listed_state` (`qr2.c:1479`), the counter whose fourth unanswered
+/// heartbeat raises "No challenge value was received from the master server"
+/// on the console. A host whose keepalives reach us keeps being
+/// told it is known even across a run of lost challenges, which is what the
+/// SDK's own note on the type — "just used to tell us the server knows about
+/// us" — says the packet is for. It is deliberately **not** sent for a session
+/// that is expired, unknown or pending-only: for those the silence is the
+/// honest answer and the host's error path is the correct outcome.
+///
+/// A failed send is distinguishable in the log and does not disturb the
+/// refresh that already happened: the host re-sends every `KA_TIME`
+/// regardless.
+///
+/// This emits the refresh's **only** log line, carrying the send outcome with
+/// it, rather than a second line per packet: a host sends one of these every
+/// `KA_TIME` for as long as it hosts, and a line each for the refresh and the
+/// answer would double the busiest category in a deployment's log for no new
+/// information. Both outcomes keep the `keepalive: session deadline refreshed`
+/// wording the refresh has always been recorded under, so an existing search
+/// for it still matches.
+fn send_keepalive(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    registry: &SharedRegistry,
+    instance_key: InstanceKey,
+    trace: &str,
+) {
+    let packet = qr2::master_packet(qr2::packet_type::KEEPALIVE, instance_key, &[]);
+    match socket.send_to(&packet, peer) {
+        Ok(_) => registry.peer_event(
+            "qr2",
+            peer,
+            &format!(
+                "keepalive: session deadline refreshed and answered ({} bytes; {trace})",
+                packet.len()
+            ),
+        ),
+        Err(error) => registry.peer_event(
+            "qr2",
+            peer,
+            &format!(
+                "keepalive: session deadline refreshed but the answer could not be sent, the \
+                 host will re-send: {error} ({trace})"
+            ),
+        ),
+    }
+}
+
 /// Check a heartbeat's `gamename` against the title this route serves.
 ///
 /// Refuses the same three ways multi-title routing does, so the two entry
@@ -956,3 +1103,6 @@ fn session_data_from(peer: SocketAddr, keys: &qr2::KeyBlock<'_>) -> SessionData 
 
 #[cfg(test)]
 mod challenge_tests;
+
+#[cfg(test)]
+mod keepalive_tests;

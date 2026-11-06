@@ -123,17 +123,48 @@ pub const V4_ONLY: &[Version] = &[Version::V4];
 /// When a side becomes eligible to be introduced to its partner.
 ///
 /// **This is server policy, not a version difference.** A peer sends one INIT
-/// per port type and `ProcessConnectPacket` in the referenced SDK acts on a
-/// CONNECT in any negotiation state, so introducing on the first INIT is
-/// legitimate. Waiting is a different trade, not a newer protocol.
+/// per port type, and waiting is a different trade rather than a newer
+/// protocol.
+///
+/// The choice is load-bearing because of a gate in the client that this crate
+/// previously documented backwards. `ProcessConnectPacket` acknowledges a
+/// CONNECT and *then* returns:
+///
+/// ```text
+/// if (p->Packet.Connect.finished == FINISHED_NOERROR)
+///     SendConnectAck(neg, fromaddr);
+/// if (neg->state >= ns_connectping)
+///     return; //don't process it any further
+/// ```
+///
+/// With `ns_initsent` 0, `ns_initack` 1 and `ns_connectping` 2, only the first
+/// two states act on a CONNECT. **The first CONNECT a peer receives is
+/// final**: a later one is acknowledged while `guessedIP` and `guessedPort`
+/// keep the values the first gave them. Processing it also moves the peer to
+/// `ns_connectping`, where `NegotiateThink` sends pings rather than INITs, so
+/// an introduced peer stops announcing any port type it has not announced yet.
+///
+/// Neither rule below is free, and the trade is not the one the old comment
+/// here described. See `docs/natneg-v3-findings.md`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Readiness {
     /// Introduce as soon as the other side is present, from the first INIT.
     ///
-    /// What this crate has always done. The introduction goes out sooner, and
-    /// if a later INIT reveals a better mapping the CONNECT is re-armed for
-    /// the new address — so the cost is extra CONNECTs on the wire for a peer
-    /// whose NAT maps each socket separately.
+    /// What this crate has always done, and the introduction goes out sooner.
+    ///
+    /// The cost is that the introduction cannot be corrected: a side is
+    /// advertised at whichever mapping arrived first, and once its partner has
+    /// acted on that CONNECT no later one can replace it. All four INITs go
+    /// out in one burst, before any CONNECT can round-trip, so plain
+    /// reordering is harmless — but a **lost** `NN_PT_GP` datagram is not,
+    /// because the introduced peer has stopped resending INITs, its game-port
+    /// mapping is never learned, and its partner punches the negotiation
+    /// socket for the rest of the negotiation.
+    ///
+    /// Kept as the default in spite of that, because it is the rule that
+    /// still completes a negotiation on a deployment which does not receive
+    /// every port type, where [`Readiness::AllRegistrations`] deadlocks
+    /// silently.
     #[default]
     OnFirstInit,
     /// Wait until the side has announced all three negotiation port types,
@@ -142,9 +173,17 @@ pub enum Readiness {
     /// The mkvsdcu v3 listener's rule, and the SDK's own completion condition
     /// for leaving `ns_initsent`. The advertised mapping is then known to be
     /// the real game-port mapping rather than whichever INIT happened to
-    /// arrive first, so exactly one CONNECT is needed per side. The cost is
-    /// that a peer whose INIT for one port type never arrives is never
-    /// introduced, and fails on [`Policy::partner_wait`] or its own timeout.
+    /// arrive first, so exactly one CONNECT is needed per side and it is the
+    /// one the peer will act on.
+    ///
+    /// The cost is a hard dependency on reaching this listener: `NN_PT_NN2`
+    /// goes to matchup2 and `NN_PT_NN3` to matchup3, so every
+    /// `{game}.natneg{1,2,3}` name must resolve here. Where they do not,
+    /// readiness is never satisfied and **no CONNECT is ever sent**. Nor does
+    /// [`Policy::partner_wait`] cover it: both sides did register, so
+    /// `expired_partners` skips the negotiation and the peers simply fail on
+    /// their own init budget — `INIT_RETRY_TIME` 500 ms by
+    /// `INIT_RETRY_COUNT` 10, about 5.5 s — with `nr_inittimeout`.
     AllRegistrations,
 }
 
@@ -241,6 +280,21 @@ pub struct Policy {
     /// How many negotiations this registry holds at once; see
     /// [`DEFAULT_MAX_NEGOTIATIONS`].
     pub max_negotiations: usize,
+    /// Whether to answer `NN_PREINIT` with `NN_PREINIT_ACK`.
+    ///
+    /// `true`, and this is the one place where a new packet type appears on
+    /// the wire without being opted into. That is deliberate: the rest of this
+    /// policy exists so an embedder's traffic does not change shape on
+    /// upgrade, but a version 4 peer that is **not** answered here sends no
+    /// INIT at all — `SendInitPackets` is reachable only with the negotiator
+    /// in its post-preinit state — so withholding the reply is not a
+    /// conservative default, it is a broken one. See
+    /// [`natneg::packet_type::PREINIT_ACK`] for the evidence.
+    ///
+    /// Set `false` only to reproduce the earlier behaviour deliberately; a
+    /// version 3 deployment is unaffected either way, because a version 3
+    /// client never sends the packet.
+    pub serve_preinit: bool,
 }
 
 impl Default for Policy {
@@ -256,6 +310,7 @@ impl Default for Policy {
             report_ack: natneg::ReportAckShape::Echoed,
             partner_wait: None,
             max_negotiations: DEFAULT_MAX_NEGOTIATIONS,
+            serve_preinit: true,
         }
     }
 }
@@ -329,6 +384,30 @@ impl Policy {
     }
 }
 
+/// One public mapping a side announced, and which of this service's sockets
+/// observed it.
+///
+/// The socket is part of the mapping and not a property of the side, because
+/// a peer announces its port types to three different matchup addresses
+/// (`SendInitPackets` sends `NN_PT_NN2` to matchup2 and `NN_PT_NN3` to
+/// matchup3) and a deployment may bind one socket per address. A reply has to
+/// leave from the socket that observed the mapping it is addressed to: to the
+/// peer's NAT a packet from another of this service's addresses is
+/// unsolicited traffic to a port opened for somebody else, and a
+/// port-restricted or symmetric NAT drops it.
+///
+/// Keeping only `Side::socket` — the socket of the *latest* INIT — was wrong
+/// for exactly that reason. `SendInitPackets` sends NN3 last, so the latest
+/// INIT is normally the natneg3 one, and a CONNECT addressed to the NN1
+/// mapping would leave from the natneg3 socket.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Mapping {
+    /// Which of this service's sockets received the INIT that announced it.
+    socket: usize,
+    /// The public address that INIT came from.
+    address: SocketAddr,
+}
+
 /// One side of a negotiation.
 #[derive(Clone, Debug)]
 struct Side {
@@ -356,7 +435,10 @@ struct Side {
     /// latest made the address a CONNECT carries depend on arrival order; the
     /// whole set is kept so the choice can be made deliberately and so a
     /// capture shows what the alternatives were.
-    mappings: BTreeMap<u8, SocketAddr>,
+    ///
+    /// Each entry carries the socket that observed it; see [`Mapping`] for why
+    /// that cannot be taken from `socket` below.
+    mappings: BTreeMap<u8, Mapping>,
     /// The peer's `usegameport` flag.
     use_game_port: bool,
     /// The address the peer believes it has, from the INIT body.
@@ -647,7 +729,7 @@ fn advertised_mapping(side: &Side) -> SocketAddr {
     side.mappings
         .iter()
         .next()
-        .map(|(_, address)| *address)
+        .map(|(_, mapping)| mapping.address)
         .unwrap_or(side.address)
 }
 
@@ -667,6 +749,9 @@ fn usable_local(side: &Side) -> Option<SocketAddrV4> {
             && !host.is_loopback()
             && !host.is_multicast()
             && !host.is_broadcast()
+            // 169.254.0.0/16. A peer that reports one of these failed to get a
+            // lease; it is not reachable from a partner even on the same LAN.
+            && !host.is_link_local()
     })
 }
 
@@ -775,19 +860,29 @@ fn missing_registrations(side: &Side) -> Vec<u8> {
     missing
 }
 
-/// Where a CONNECT for this side is delivered; see [`ControlEndpoint`].
+/// Where a CONNECT for this side is delivered, and which socket it must leave
+/// from; see [`ControlEndpoint`] and [`Mapping`].
 ///
 /// Distinct from `advertised_mapping`, which is the address the *partner* is
 /// told to punch. Conflating the two is what made a CONNECT land on a game
 /// socket a title may never pump.
-fn control_endpoint(side: &Side, endpoint: ControlEndpoint) -> SocketAddr {
+///
+/// Returns the socket with the address rather than letting the caller reach
+/// for `Side::socket`: those two agree under [`ControlEndpoint::LatestInit`]
+/// and need not agree under [`ControlEndpoint::NegotiationMapping`], and
+/// every caller that took them separately paired them wrongly.
+fn control_endpoint(side: &Side, endpoint: ControlEndpoint) -> Mapping {
+    let latest = Mapping {
+        socket: side.socket,
+        address: side.address,
+    };
     match endpoint {
-        ControlEndpoint::LatestInit => side.address,
+        ControlEndpoint::LatestInit => latest,
         ControlEndpoint::NegotiationMapping => side
             .mappings
             .get(&natneg::port_type::NEGOTIATION_1)
             .copied()
-            .unwrap_or(side.address),
+            .unwrap_or(latest),
     }
 }
 
@@ -964,11 +1059,11 @@ impl Pending {
                             });
                         }
                         if let Some(previous) = held.mappings.get(&side.port_type)
-                            && *previous != side.address
+                            && previous.address != side.address
                         {
                             return Err(InitRefusal::SourcePinned {
                                 port_type: side.port_type,
-                                held: *previous,
+                                held: previous.address,
                                 announced: side.address,
                             });
                         }
@@ -1020,8 +1115,8 @@ impl Pending {
             }
             side.first_seen = previous.first_seen;
             side.inits = previous.inits.saturating_add(1);
-            for (port_type, address) in &previous.mappings {
-                side.mappings.entry(*port_type).or_insert(*address);
+            for (port_type, mapping) in &previous.mappings {
+                side.mappings.entry(*port_type).or_insert(*mapping);
             }
             // A resend is the same side, so whatever CONNECT it has already
             // been sent is still the one in flight: losing this would resend
@@ -1029,8 +1124,16 @@ impl Pending {
             side.connect = previous.connect.clone();
         }
         // The INIT just received is the current mapping for its own port
-        // type, overriding anything carried forward for it.
-        side.mappings.insert(side.port_type, side.address);
+        // type, overriding anything carried forward for it. The socket it
+        // arrived on travels with it, because that is the only socket a reply
+        // to this address may leave from.
+        side.mappings.insert(
+            side.port_type,
+            Mapping {
+                socket: side.socket,
+                address: side.address,
+            },
+        );
         let current = side.clone();
         sides.insert(key, side);
         // The most recently heard-from other side, not an arbitrary one:
@@ -1079,10 +1182,36 @@ impl Pending {
     /// say whether it should go out at all.
     ///
     /// `true` means send it; `false` means an identical introduction is
-    /// already being delivered or has been acknowledged, so sending again
-    /// would only duplicate what the retry pass already owns. A CONNECT
-    /// naming a *different* address restarts delivery: the partner rebound,
-    /// and the address this side was given is now wrong.
+    /// already being delivered, so sending again would only duplicate what
+    /// the retry pass already owns. A CONNECT naming a *different* address
+    /// restarts delivery while this side has not acknowledged one: the
+    /// partner rebound, and the address this side was given is now wrong.
+    ///
+    /// Delivery whose attempts are **exhausted** is re-armed as well, even
+    /// for the same address. Once [`CONNECT_ATTEMPTS`] copies have gone out
+    /// unacknowledged the retry pass owns nothing, so suppressing the send
+    /// would leave that side holding a CONNECT nobody will ever send again
+    /// and no way to be given another. The peer this strands is the one the
+    /// paragraph below is about: a peer that restarted its negotiation on
+    /// this cookie names the *same* partner as before whenever that partner
+    /// is a stable game host, which is the ordinary case, so the address test
+    /// alone never re-arms it.
+    ///
+    /// A side that has already **acknowledged** a CONNECT is re-armed anyway
+    /// when the address differs, and deliberately so. A peer which acted on
+    /// the first one is past `ns_connectping` and will acknowledge the new
+    /// introduction without adopting its address, so those sends are wasted —
+    /// but the server cannot distinguish that peer from one that has
+    /// restarted its negotiation on the same cookie, which does need a fresh
+    /// CONNECT and has no other way to get one. Wasting packets on a peer
+    /// that ignores them is the better of the two errors; suppressing the
+    /// send strands the peer that restarted.
+    ///
+    /// Neither re-arming rule becomes a send loop: both reset the attempt
+    /// count, so the next INIT finds delivery running again and is
+    /// suppressed. One side therefore costs at most [`CONNECT_ATTEMPTS`]
+    /// copies per [`CONNECT_RETRY`] × [`CONNECT_ATTEMPTS`] however fast its
+    /// INITs arrive.
     ///
     /// A side this registry does not hold is still sent its CONNECT. The only
     /// caller that can present one is a direct introduction, and declining to
@@ -1103,10 +1232,20 @@ impl Pending {
         else {
             return true;
         };
-        if let Some(connect) = &side.connect
-            && connect.partner == partner
-        {
-            return false;
+        if let Some(connect) = &side.connect {
+            // Delivery this service has given up on is not delivery. The
+            // retry pass stops at CONNECT_ATTEMPTS, so past that it owns
+            // nothing and there is nothing left for a suppressed send to
+            // duplicate.
+            //
+            // Not `abandoned`: that word is taken, by a *cookie* closed after
+            // `Policy::partner_wait` ran out (`Negotiation::abandoned`,
+            // `InitRefusal::Abandoned`). This is one side's CONNECT delivery
+            // running out of attempts, which says nothing about the cookie.
+            let exhausted = !connect.acknowledged && connect.attempts >= CONNECT_ATTEMPTS;
+            if connect.partner == partner && !exhausted {
+                return false;
+            }
         }
         side.connect = Some(Connect {
             partner,
@@ -1130,8 +1269,11 @@ impl Pending {
                 continue;
             }
             for (key, side) in negotiation.sides.iter_mut() {
-                let target = control_endpoint(side, endpoint);
-                let socket = side.socket;
+                // Address and socket together: see `control_endpoint`.
+                let Mapping {
+                    socket,
+                    address: target,
+                } = control_endpoint(side, endpoint);
                 let version = side.version;
                 let Some(connect) = &mut side.connect else {
                     continue;
@@ -1191,13 +1333,14 @@ impl Pending {
             }
             negotiation.abandoned = true;
             for (key, side) in negotiation.sides.iter() {
+                let reply_to = control_endpoint(side, endpoint);
                 failed.push(FailedConnect {
                     title: title.clone(),
                     cookie: *cookie,
                     client_index: key.client_index,
-                    socket: side.socket,
+                    socket: reply_to.socket,
                     version: side.version,
-                    target: control_endpoint(side, endpoint),
+                    target: reply_to.address,
                     waited: now.duration_since(negotiation.created),
                 });
             }
@@ -1213,12 +1356,15 @@ impl Pending {
     /// it has no body this project has read, let alone a name field — so the
     /// registry is what resolves which negotiation it belongs to.
     ///
-    /// **Any** announced mapping counts, not only the latest INIT's: the SDK
-    /// sends its CONNECT_ACK from the socket that received the CONNECT, which
-    /// under [`ControlEndpoint::NegotiationMapping`] is deliberately not the
-    /// most recent INIT's source. An acknowledgement from an address this
-    /// side never announced settles nothing, which is what makes this a
-    /// source check rather than a cookie lookup.
+    /// **Any** announced mapping counts, not only the latest INIT's.
+    /// `SendConnectAck` always sends from `neg->negotiateSock`, whichever
+    /// socket received the CONNECT — so the acknowledgement arrives from a
+    /// negotiation mapping even when the CONNECT was delivered to the game
+    /// port, and under [`ControlEndpoint::NegotiationMapping`] the endpoint
+    /// addressed is deliberately not the most recent INIT's source either.
+    /// An acknowledgement from an address this side never announced settles
+    /// nothing, which is what makes this a source check rather than a cookie
+    /// lookup.
     fn acknowledge_connect(&mut self, cookie: u32, from: SocketAddr, now: Instant) -> Vec<Acked> {
         let mut acked = Vec::new();
         for ((title, held), negotiation) in self.negotiations.iter_mut() {
@@ -1226,7 +1372,12 @@ impl Pending {
                 continue;
             }
             for (key, side) in negotiation.sides.iter_mut() {
-                if side.address != from && !side.mappings.values().any(|mapping| *mapping == from) {
+                if side.address != from
+                    && !side
+                        .mappings
+                        .values()
+                        .any(|mapping| mapping.address == from)
+                {
                     continue;
                 }
                 // The peer is demonstrably still here, so this is the side's
@@ -1417,8 +1568,8 @@ fn prepare<O: Observer>(
              public mapping otherwise, resent every {} ms up to {} times until the peer's \
              connect_ack (type {}) arrives; acknowledges every report (type {}) with a \
              report_ack (type {}), which is what lets a peer tell its game the negotiation \
-             finished. Performs no endpoint resolution test and does \
-             not serve preinit. Serves {} of the three ports the SDK probes ({}). Pairs on \
+             finished. Performs no endpoint resolution test. Preinit (type {} answered with \
+             type {}) {}. Serves {} of the three ports the SDK probes ({}). Pairs on \
              cookie, client index and host, preferring the most recently heard-from side; \
              title routing {}. Accepts protocol version(s) {}, carried per \
              participant and echoed in every reply; mixed-version pairing {}. \
@@ -1432,6 +1583,14 @@ fn prepare<O: Observer>(
             natneg::packet_type::CONNECT_ACK,
             natneg::packet_type::REPORT,
             natneg::packet_type::REPORT_ACK,
+            natneg::packet_type::PREINIT,
+            natneg::packet_type::PREINIT_ACK,
+            if policy.serve_preinit {
+                "is answered with state 2 (READY), which is what lets a version 4 peer send \
+                 its inits at all"
+            } else {
+                "is NOT answered, so a version 4 peer that sends one will never send an init"
+            },
             binds.len(),
             binds
                 .iter()
@@ -1841,6 +2000,28 @@ fn serve<O: Observer>(shared: &Shared<O>, index: usize, stop: &StopSignal) {
                     }
                 }
             }
+            Ok(Packet::Preinit(preinit)) => {
+                // Answered before anything else and without consulting the
+                // registry, because this reply is what lets the peer send the
+                // INIT the registry is populated from. Nothing is recorded
+                // for the cookie here: a preinit carries no port type, no
+                // mapping and no title name, so there is nothing a pairing
+                // decision could be made from.
+                if policy.serve_preinit {
+                    acknowledge_preinit(shared, index, peer, datagram, &preinit);
+                } else {
+                    observer.peer_event(
+                        "natneg",
+                        peer,
+                        &format!(
+                            "preinit trace: cookie={:#010x} index={} is not answered because \
+                             this deployment disabled preinit; this peer will resend and then \
+                             fail without ever sending an init",
+                            preinit.cookie, preinit.client_index,
+                        ),
+                    );
+                }
+            }
             Ok(Packet::ConnectAck { version, cookie }) => {
                 let _ = version;
                 // The only thing that stops this service resending a CONNECT.
@@ -2003,6 +2184,63 @@ fn acknowledge_init<O: Observer>(
             &format!(
                 "init_ack could not be sent for {cookie:#010x} port_type {port_type}, \
                  the peer will resend its init and may exhaust its retry budget: {error}"
+            ),
+        ),
+    }
+}
+
+/// Answer a `NN_PREINIT`, which is what lets a version 4 peer send its INITs.
+///
+/// Replies [`natneg::preinit_state::READY`] immediately rather than parking
+/// the peer with `WAITING` until a partner appears. Both are valid and the
+/// client accepts either; READY makes a version 4 negotiation proceed exactly
+/// as a version 3 one does, so the pairing engine, [`Policy::partner_wait`]
+/// and the peer's own `PARTNER_WAIT_TIME` continue to decide everything about
+/// waiting for a partner, and no new registry state or timer is introduced.
+///
+/// The cost is that preinit's own benefit is unused: `WAITING` sets the peer's
+/// timer to 10 s with 12 attempts, which could hold a lone peer for about two
+/// minutes instead of the roughly five seconds its init budget allows. Doing
+/// that needs the cookie's two sides tracked across the preinit phase, which
+/// is a separate change; see `docs/natneg-v4-open-questions.md`.
+fn acknowledge_preinit<O: Observer>(
+    shared: &Shared<O>,
+    socket: usize,
+    peer: SocketAddr,
+    datagram: &[u8],
+    preinit: &natneg::Preinit,
+) {
+    let observer = &shared.observer;
+    let Some(packet) = natneg::preinit_ack(datagram, natneg::preinit_state::READY) else {
+        // Unreachable for a parsed preinit, which `parse` already length-checked.
+        observer.peer_event(
+            "natneg",
+            peer,
+            "preinit could not be answered: shorter than a preinit packet",
+        );
+        return;
+    };
+    match shared.sockets[socket].send_to(&packet, peer) {
+        Ok(_) => observer.peer_event(
+            "natneg",
+            peer,
+            &format!(
+                "preinit_ack sent for {:#010x}: index {}, state {} (READY), version {}, \
+                 {} bytes; this is what releases the peer into the init phase",
+                preinit.cookie,
+                preinit.client_index,
+                natneg::preinit_state::READY,
+                preinit.version,
+                packet.len(),
+            ),
+        ),
+        Err(error) => observer.peer_event(
+            "natneg",
+            peer,
+            &format!(
+                "preinit_ack could not be sent for {:#010x}; the peer will resend its preinit \
+                 and will never send an init until one arrives: {error}",
+                preinit.cookie
             ),
         ),
     }
@@ -2239,7 +2477,13 @@ fn introduce<O: Observer>(shared: &Shared<O>, title: &str, cookie: u32, one: &Si
         );
     }
     for (target, partner) in [(one, two), (two, one)] {
-        let endpoint = control_endpoint(target, shared.policy.control_endpoint);
+        // Address and socket together: see `control_endpoint`. The CONNECT
+        // leaves from the socket that observed this endpoint, not from
+        // whichever socket the target's latest INIT happened to arrive on.
+        let Mapping {
+            socket: endpoint_socket,
+            address: endpoint,
+        } = control_endpoint(target, shared.policy.control_endpoint);
         let (chosen, reason) = connect_address(target, partner);
         let (address, port) = match chosen {
             ConnectAddress::Private(address) => (*address.ip(), address.port()),
@@ -2298,12 +2542,12 @@ fn introduce<O: Observer>(shared: &Shared<O>, title: &str, cookie: u32, one: &Si
             );
             continue;
         }
-        // From the socket this target's own INIT arrived on, not whichever
-        // socket happens to be running this pairing.
+        // From the socket that observed the endpoint being addressed, not
+        // whichever socket happens to be running this pairing.
         deliver_connect(
             shared,
             Delivery {
-                socket: target.socket,
+                socket: endpoint_socket,
                 target: endpoint,
                 cookie,
                 version: target.version,
@@ -2319,7 +2563,12 @@ fn introduce<O: Observer>(shared: &Shared<O>, title: &str, cookie: u32, one: &Si
 fn mappings(side: &Side) -> String {
     side.mappings
         .iter()
-        .map(|(port_type, address)| format!("{port_type}={address}"))
+        .map(|(port_type, mapping)| {
+            // The socket is part of the line because a mapping addressed from
+            // the wrong one is dropped by the peer's NAT, and that is
+            // otherwise invisible in a capture.
+            format!("{port_type}={}(socket {})", mapping.address, mapping.socket)
+        })
         .collect::<Vec<_>>()
         .join(",")
 }

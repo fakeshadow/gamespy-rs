@@ -200,3 +200,12 @@ Switching to it means:
   can differ under `Readiness::OnFirstInit`.
 - Nothing here has been validated against a console. See the test section of
   the changelog entry for what was actually run.
+
+## Review findings and open work
+
+`natneg-v3-findings.md` records a review of this implementation against the
+pinned `NN_PROTVER 3` SDK sources, with the wire codec verified correct, five
+ranked findings and the open TODOs for each. Findings 1 and 2 there fire only
+under `Policy::v3_compatible()` and finding 4 only under `Policy::default()`,
+so identify the configured policy before reading them. That document is
+version 3 only; version 4 is reviewed separately.
